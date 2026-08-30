@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+*.rlib
+*.rmeta
+Cargo.lock
+.cargo
+
+# Environment variables
+.env
+.env.local
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.sublime-*
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Build/Debug
+*.pdb
+dist/
+*.log
