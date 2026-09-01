@@ -53,8 +53,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Check deterministic simulation invariants
+        run: bash .github/scripts/check-sim-invariants.sh
       - run: cargo test --lib
       - run: cargo test --test '*' --verbose
+      - name: Deterministic replay stress test
+        run: cargo test --lib sim::tests::same_seed_is_deterministic_for_one_thousand_seeds -- --ignored
+      - name: Clean-build golden trace check
+        run: |
+          cargo clean
+          cargo test --lib sim::tests::canonical_trace_matches_golden_fixture
 
   build:
     name: Build
