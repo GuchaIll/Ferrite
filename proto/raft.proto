@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package raft;
+
+//triggered by election when a follower's election timeout fired. Tries
+//to promote itself into a candidate
+
+//Sender: Candidate
+//Receiver: every other node in cluster
+//Collect votes to become the leader, need majority
+message RequestVoteRequest{
+    uint64 term            =1; //candidate's current term
+    uint64 candidate_id    =2; //who is requesting vote
+    uint64 last_log_index  =3; //candidate's last log entry index
+    uint64 last_log_term   =4; //candidate;s last log entry term
+}
+//receiver uses last log index and last log term for log freshness check
+//receiver grants the vote if candidate's log is at least as up-to-date as receiver's
+
+
+message RequestVoteResponse {
+    uint64 term =1;
+    bool vote_granted =2;
+}
+
+message LogEntry {
+    uint64 term =1;
+    uint64 index = 2;
+    bytes command = 3;
+}
+
+//Used in replication and heartbeat
+//Sender: leader
+//Receiver: every follower
+//Purpose(replication): replicate new log entries, advance follower commit index
+//Purpose(heartbeat): assert leadership, reset follower's election timers, entries field empty
+message AppendEntriesRequest {
+    uint64 term            =1; //leader's current term
+    uint64 leader_id       =2;  //used for follower to redirect clients
+    uint64 prev_log_index  =3;  //consistency check anchor
+    uint64 prev_log_term   =4;  //consistency check anchor
+    repeated LogEntry entries =5;   //empty = heartbeat, populate = log replication
+    uint64 leader_commit   =6;      //leader's current commit index'
+}
+
+//receiver rejects success = false if leader term < receiver's term indicating stale leader
+//no entry at prev_log_index with matching prev_log_term, conflict log divergence
+//on rejection from divergence, leader decrements nextIndex[follower] and retries with an earlier anchor.
+//Walks back until consistency checks passes, then replays forward from that point
+message AppendEntriesResponse {
+    uint64 term =1;
+    bool success =2;
+}
+
+//when a follower is so far behind that the elader no logner has the log entries need to catch it up
+//they've been compacted into a snapshot
+
+//sender: leader
+//receiver: lagging follower by id
+//log compact old commited entries into a snapshot. Point in dump of the entrie state machine and
+//discard the old log entries. Snapshot is sent to lagging follower to catch it up. Snapshot is also used for new nodes joining the cluster
+
+
+message SnapshotRequest {
+    uint64 term =1;
+    uint64 leader_id =2;
+    uint64 last_included_index =3;
+    uint64 last_included_term =4;
+    bytes data =5;
+    bool done =6;
+}
+
+message SnapshotResponse {
+    uint64 term =1;
+}
+
+service RaftService {
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+}
