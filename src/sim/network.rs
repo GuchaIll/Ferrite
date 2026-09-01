@@ -1,3 +1,1 @@
 //! Simulated network behavior.
-
-

@@ -4,7 +4,6 @@ pub mod clock;
 pub mod network;
 pub mod trace;
 
-
 pub type NodeId = u64;
 
 pub enum SimInput {
@@ -20,5 +19,3 @@ pub trait SimNode {
     fn id(&self) -> NodeId;
     fn step(&mut self, input: SimInput) -> SimOutput;
 }
-
-
