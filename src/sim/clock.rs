@@ -23,10 +23,10 @@ impl SimClock {
 
     /// Advances logical time by `ticks`.
     pub fn advance(&mut self, ticks: u64) {
-        self.tick = self
-            .tick
-            .checked_add(ticks)
-            .expect("simulation clock tick counter overflow");
+        self.tick = match self.tick.checked_add(ticks) {
+            Some(tick) => tick,
+            None => panic!("simulation clock tick counter overflow"),
+        };
     }
 }
 
@@ -81,4 +81,3 @@ mod tests {
         assert_eq!(clock.now(), 42);
     }
 }
-

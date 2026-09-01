@@ -34,7 +34,6 @@ impl TraceEventKind {
         }
     }
 }
-
 /// Optional event data, deliberately limited to deterministic values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TracePayload {
