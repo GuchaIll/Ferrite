@@ -24,7 +24,8 @@ jobs:
           exit 1
       - name: Require approval
         if: github.event_name == 'pull_request'
-        run: echo "✓ Pull request mode: CI checks will verify"
+        run: |
+          echo "Pull request mode: CI checks will verify"
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
