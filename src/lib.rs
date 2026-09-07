@@ -6,5 +6,6 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod kv;
+pub mod raft;
 pub mod server;
 pub mod sim;
