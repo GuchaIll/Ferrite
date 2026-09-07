@@ -13,6 +13,7 @@ use self::{
     clock::{Clock, SimClock},
     trace::{Trace, TraceEvent, TraceEventKind, TracePayload},
 };
+use crate::raft::{RaftRpc, LogEntry, HardState};
 
 pub mod clock;
 pub mod network;
@@ -22,18 +23,25 @@ pub mod trace;
 pub type NodeId = u64;
 
 /// Input delivered by the deterministic driver to a simulated node.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     /// One global logical tick has begun.
     Tick,
+    Message {  from: NodeId, rpc: RaftRpc }, ClientCommand(Vec<u8>)
 }
 
 /// An output returned from a simulated node.
 ///
-/// The driver drains this vector in order before it steps the next node. More
-/// output types will be added in issue #6.
+/// The driver drains this vector in order before it steps the next node.
+///
+/// The ordering is a contract, not an implementation detail: `Persist` must
+/// be drained before any `Send` that depends on it, since Raft requires a
+/// node to persist `currentTerm`/`votedFor` before responding to an RPC. A
+/// driver that reorders this for throughput introduces a data-loss bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     /// Test-only evidence that [`EchoNode`] processed a tick.
-    Echo { payload: Vec<u8> },
+    Echo { payload: Vec<u8> }, Send { to: NodeId, rpc: RaftRpc }, Apply(LogEntry), Persist(HardState)
 }
 
 /// Synchronous simulated node driven by [`Simulator`].
@@ -101,6 +109,9 @@ impl SimNode for EchoNode {
             Input::Tick => vec![Output::Echo {
                 payload: self.rng.next_u64().to_le_bytes().to_vec(),
             }],
+            // TODO: EchoNode only proves the tick/RNG plumbing; message and
+            // client-command handling lands with the real Raft node.
+            Input::Message { .. } | Input::ClientCommand(_) => Vec::new(),
         }
     }
 }
@@ -173,6 +184,10 @@ impl<N: SimNode> Simulator<N> {
                             Some(node_id),
                             Some(TracePayload::Bytes(payload)),
                         )),
+                        // TODO: wire real trace recording once message
+                        // delivery, log application, and persistence are
+                        // implemented in the driver.
+                        Output::Send { .. } | Output::Apply(_) | Output::Persist(_) => {}
                     }
                 }
             }
@@ -226,6 +241,7 @@ mod tests {
                     Output::Echo { payload: vec![1] },
                     Output::Echo { payload: vec![2] },
                 ],
+                Input::Message { .. } | Input::ClientCommand(_) => Vec::new(),
             }
         }
     }
