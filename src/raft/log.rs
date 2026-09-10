@@ -80,7 +80,7 @@ impl std::error::Error for LogLookupError {}
 ///
 /// Index zero is not an entry. It is the empty-prefix sentinel used by
 /// `AppendEntries` when a follower must receive the first entry.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RaftLog {
     entries: Vec<LogEntry>,
     /// Index of the oldest entry still held. Entries below this were removed
@@ -138,7 +138,9 @@ impl RaftLog {
             requested: index,
             last_index: self.last_index(),
         };
-        let offset = index.checked_sub(self.start_index).ok_or_else(out_of_range)?;
+        let offset = index
+            .checked_sub(self.start_index)
+            .ok_or_else(out_of_range)?;
         let offset = usize::try_from(offset).map_err(|_| out_of_range())?;
         self.entries.get(offset).ok_or_else(out_of_range)
     }
@@ -310,7 +312,11 @@ mod tests {
     #[test]
     fn compacted_lookup_reports_the_start_index() {
         let mut log = RaftLog::new();
-        for item in [entry(1, 1, b"one"), entry(2, 1, b"two"), entry(3, 2, b"three")] {
+        for item in [
+            entry(1, 1, b"one"),
+            entry(2, 1, b"two"),
+            entry(3, 2, b"three"),
+        ] {
             log.append(item).unwrap();
         }
 
@@ -429,7 +435,10 @@ mod property_tests {
     use super::{LogEntry, RaftLog};
 
     fn arb_entries() -> impl Strategy<Value = Vec<(u64, Vec<u8>)>> {
-        prop::collection::vec((0u64..1000, prop::collection::vec(any::<u8>(), 0..8)), 0..30)
+        prop::collection::vec(
+            (0u64..1000, prop::collection::vec(any::<u8>(), 0..8)),
+            0..30,
+        )
     }
 
     fn build_log(entries: &[(u64, Vec<u8>)]) -> RaftLog {
