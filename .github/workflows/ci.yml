@@ -24,7 +24,8 @@ jobs:
           exit 1
       - name: Require approval
         if: github.event_name == 'pull_request'
-        run: echo "✓ Pull request mode: CI checks will verify"
+        run: |
+          echo "Pull request mode: CI checks will verify"
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -55,6 +56,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check deterministic simulation invariants
         run: bash .github/scripts/check-sim-invariants.sh
+      - name: Check Raft core stays synchronous
+        run: bash .github/scripts/check-raft-invariants.sh
       - run: cargo test --lib
       - run: cargo test --test '*' --verbose
       - name: Deterministic replay stress test

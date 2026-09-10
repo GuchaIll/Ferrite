@@ -2,7 +2,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(test, allow(clippy::unnecessary_literal_unwrap))]
 
+pub mod cli;
+pub mod config;
 pub mod error;
 pub mod kv;
+pub mod raft;
 pub mod server;
 pub mod sim;

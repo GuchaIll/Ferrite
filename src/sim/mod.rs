@@ -1,40 +1,32 @@
 //! Single-threaded deterministic simulator harness.
 //!
 //! A global step enters logical tick `t`, steps nodes in ascending [`NodeId`]
-//! order, drains each node's outputs in returned order, records `TickEnd`, and
-//! then advances the clock to `t + 1`. Nodes never receive the clock.
+//! order, drains each node's outputs in returned order, delivers queued
+//! messages to completion within the same tick, records `TickEnd`, and then
+//! advances the clock to `t + 1`. Nodes never receive the clock.
 
 use std::collections::BTreeMap;
 
-use rand::{RngCore, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use self::{
     clock::{Clock, SimClock},
+    network::Network,
     trace::{Trace, TraceEvent, TraceEventKind, TracePayload},
 };
 
 pub mod clock;
+pub mod io;
 pub mod network;
+pub mod raft_node;
+pub mod scenario;
+#[cfg(test)]
+pub mod test_node;
 pub mod trace;
 
-/// Identifier of a simulated node. Zero is reserved and invalid.
-pub type NodeId = u64;
-
-/// Input delivered by the deterministic driver to a simulated node.
-pub enum Input {
-    /// One global logical tick has begun.
-    Tick,
-}
-
-/// An output returned from a simulated node.
-///
-/// The driver drains this vector in order before it steps the next node. More
-/// output types will be added in issue #6.
-pub enum Output {
-    /// Test-only evidence that [`EchoNode`] processed a tick.
-    Echo { payload: Vec<u8> },
-}
+use crate::config::NodeId;
+pub use io::{Input, Output};
 
 /// Synchronous simulated node driven by [`Simulator`].
 pub trait SimNode {
@@ -75,41 +67,14 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-/// Minimal node used to prove the deterministic step-loop and RNG plumbing.
-pub struct EchoNode {
-    id: NodeId,
-    rng: ChaCha8Rng,
-}
-
-impl EchoNode {
-    /// Constructs an echo node with its independent deterministic RNG stream.
-    pub fn new(root_seed: u64, id: NodeId) -> Self {
-        Self {
-            id,
-            rng: node_rng(root_seed, id),
-        }
-    }
-}
-
-impl SimNode for EchoNode {
-    fn id(&self) -> NodeId {
-        self.id
-    }
-
-    fn step(&mut self, input: Input) -> Vec<Output> {
-        match input {
-            Input::Tick => vec![Output::Echo {
-                payload: self.rng.next_u64().to_le_bytes().to_vec(),
-            }],
-        }
-    }
-}
-
 /// Driver-owned deterministic simulation state.
 pub struct Simulator<N: SimNode> {
     clock: SimClock,
     root_seed: u64,
     nodes: BTreeMap<NodeId, N>,
+    network: Network,
+    /// Durable hard-state last observed per node (sim-side bookkeeping).
+    persisted: BTreeMap<NodeId, crate::raft::HardState>,
     trace: Trace,
 }
 
@@ -146,6 +111,8 @@ impl<N: SimNode> Simulator<N> {
             clock: SimClock::new(),
             root_seed: seed,
             nodes: registered,
+            network: Network::new(),
+            persisted: BTreeMap::new(),
             trace,
         }
     }
@@ -157,7 +124,11 @@ impl<N: SimNode> Simulator<N> {
             self.trace
                 .record(TraceEvent::new(tick, TraceEventKind::TickStart, None, None));
 
-            for (&node_id, node) in &mut self.nodes {
+            // Phase 1: step every node on Tick, draining outputs immediately.
+            // Collect node IDs first so we can mutably re-borrow per node while
+            // delivering cascading message effects.
+            let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+            for node_id in node_ids {
                 self.trace.record(TraceEvent::new(
                     tick,
                     TraceEventKind::NodeStep,
@@ -165,17 +136,16 @@ impl<N: SimNode> Simulator<N> {
                     None,
                 ));
 
-                for output in node.step(Input::Tick) {
-                    match output {
-                        Output::Echo { payload } => self.trace.record(TraceEvent::new(
-                            tick,
-                            TraceEventKind::Echo,
-                            Some(node_id),
-                            Some(TracePayload::Bytes(payload)),
-                        )),
-                    }
-                }
+                let Some(node) = self.nodes.get_mut(&node_id) else {
+                    continue;
+                };
+                let outputs = node.step(Input::Tick);
+                self.drain_outputs(tick, node_id, outputs);
             }
+
+            // Phase 2: deliver all queued messages (and any cascading replies)
+            // within the same logical tick, FIFO.
+            self.deliver_pending(tick);
 
             self.trace
                 .record(TraceEvent::new(tick, TraceEventKind::TickEnd, None, None));
@@ -183,6 +153,80 @@ impl<N: SimNode> Simulator<N> {
         }
 
         &self.trace
+    }
+
+    /// Drains ordered outputs from `from`, enqueuing sends onto the network.
+    fn drain_outputs(&mut self, tick: u64, from: NodeId, outputs: Vec<Output>) {
+        for output in outputs {
+            match output {
+                #[cfg(test)]
+                Output::Echo { payload } => self.trace.record(TraceEvent::new(
+                    tick,
+                    TraceEventKind::Echo,
+                    Some(from),
+                    Some(TracePayload::Bytes(payload)),
+                )),
+                Output::Persist(hard_state) => {
+                    self.persisted.insert(from, hard_state);
+                    // Persistence is durable bookkeeping; no trace kind yet beyond
+                    // future extension. Effects ordering is still enforced by
+                    // draining Persist before subsequent Sends in this list.
+                }
+                Output::Apply(_entry) => {
+                    // Application is out of scope for election delivery.
+                }
+                Output::Send { to, rpc } => {
+                    self.trace.record(TraceEvent::new(
+                        tick,
+                        TraceEventKind::Send,
+                        Some(from),
+                        None,
+                    ));
+                    self.network.enqueue(from, to, rpc);
+                }
+            }
+        }
+    }
+
+    /// Delivers every queued message, draining any effects produced by delivery.
+    fn deliver_pending(&mut self, tick: u64) {
+        // Bound cascades to avoid infinite loops on buggy handlers.
+        let mut steps = 0_u64;
+        const MAX_DELIVERIES_PER_TICK: u64 = 100_000;
+
+        while let Some(msg) = self.network.pop_front() {
+            steps = steps.saturating_add(1);
+            assert!(
+                steps <= MAX_DELIVERIES_PER_TICK,
+                "message cascade exceeded {MAX_DELIVERIES_PER_TICK} deliveries in one tick"
+            );
+
+            if !self.nodes.contains_key(&msg.to) {
+                self.trace.record(TraceEvent::new(
+                    tick,
+                    TraceEventKind::Drop,
+                    Some(msg.from),
+                    None,
+                ));
+                continue;
+            }
+
+            self.trace.record(TraceEvent::new(
+                tick,
+                TraceEventKind::Deliver,
+                Some(msg.to),
+                None,
+            ));
+
+            let Some(node) = self.nodes.get_mut(&msg.to) else {
+                continue;
+            };
+            let outputs = node.step(Input::Message {
+                from: msg.from,
+                rpc: msg.rpc,
+            });
+            self.drain_outputs(tick, msg.to, outputs);
+        }
     }
 
     /// Returns the cumulative simulation trace.
@@ -199,12 +243,27 @@ impl<N: SimNode> Simulator<N> {
     pub fn clock(&self) -> &SimClock {
         &self.clock
     }
+
+    /// Returns registered nodes in ascending ID order.
+    pub fn nodes(&self) -> &BTreeMap<NodeId, N> {
+        &self.nodes
+    }
+
+    /// Returns last-persisted hard state per node (sim bookkeeping).
+    pub fn persisted(&self) -> &BTreeMap<NodeId, crate::raft::HardState> {
+        &self.persisted
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{node_rng, EchoNode, Input, Output, SimNode, Simulator};
-    use crate::{sim::clock::Clock, sim::trace::TraceEventKind};
+    use super::test_node::EchoNode;
+    use super::{Input, Output, SimNode, Simulator, node_rng};
+    use crate::{
+        raft::{RaftNode, RaftRpc, RequestVoteRequest, RequestVoteResponse},
+        sim::clock::Clock,
+        sim::trace::TraceEventKind,
+    };
     use rand::RngCore;
 
     fn echo_nodes(seed: u64, ids: &[u64]) -> Vec<EchoNode> {
@@ -226,6 +285,43 @@ mod tests {
                     Output::Echo { payload: vec![1] },
                     Output::Echo { payload: vec![2] },
                 ],
+                Input::Message { .. } | Input::ClientCommand(_) => Vec::new(),
+            }
+        }
+    }
+
+    /// Node that replies to any RequestVote with a fixed response, for delivery tests.
+    struct BounceNode {
+        id: u64,
+    }
+
+    impl SimNode for BounceNode {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn step(&mut self, input: Input) -> Vec<Output> {
+            match input {
+                Input::Tick if self.id == 1 => vec![Output::Send {
+                    to: 2,
+                    rpc: RaftRpc::RequestVote(RequestVoteRequest {
+                        term: 1,
+                        candidate_id: 1,
+                        last_log_index: 0,
+                        last_log_term: 0,
+                    }),
+                }],
+                Input::Message {
+                    from,
+                    rpc: RaftRpc::RequestVote(_),
+                } => vec![Output::Send {
+                    to: from,
+                    rpc: RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                        term: 1,
+                        vote_granted: true,
+                    }),
+                }],
+                _ => Vec::new(),
             }
         }
     }
@@ -276,6 +372,52 @@ mod tests {
              tick=0 kind=echo node=2 payload=hex:01\n\
              tick=0 kind=echo node=2 payload=hex:02\n\
              tick=0 kind=tick_end node=- payload=-\n"
+        );
+    }
+
+    #[test]
+    fn delivers_send_outputs_as_messages_same_tick() {
+        let mut simulator = Simulator::new(
+            1,
+            vec![
+                BounceNode { id: 1 },
+                BounceNode { id: 2 },
+            ],
+        );
+
+        let trace = simulator.run(1);
+        let kinds: Vec<_> = trace
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind(),
+                    TraceEventKind::Send | TraceEventKind::Deliver
+                )
+            })
+            .map(|e| (e.kind(), e.node()))
+            .collect();
+
+        // Node 1 sends RequestVote → deliver to 2 → 2 replies → deliver to 1.
+        assert!(
+            kinds.iter().any(|(k, n)| *k == TraceEventKind::Send && *n == Some(1)),
+            "expected send from 1, got {kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|(k, n)| *k == TraceEventKind::Deliver && *n == Some(2)),
+            "expected deliver to 2, got {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|(k, n)| *k == TraceEventKind::Send && *n == Some(2)),
+            "expected reply send from 2, got {kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|(k, n)| *k == TraceEventKind::Deliver && *n == Some(1)),
+            "expected deliver reply to 1, got {kinds:?}"
         );
     }
 
@@ -375,5 +517,29 @@ mod tests {
 
         assert_eq!(simulator.clock().now(), 10_000);
         assert_eq!(simulator.trace().len(), 80_001);
+    }
+
+    #[test]
+    fn raft_cluster_elects_leader_with_message_delivery() {
+        let seed = 1_u64;
+        let ids = [1_u64, 2, 3];
+        let nodes: Vec<RaftNode> = ids
+            .iter()
+            .map(|&id| {
+                let peers: Vec<_> = ids.iter().copied().filter(|&p| p != id).collect();
+                RaftNode::with_rng(id, peers, node_rng(seed, id))
+            })
+            .collect();
+
+        let mut sim = Simulator::new(seed, nodes);
+        sim.run(600);
+
+        let leaders: Vec<_> = sim
+            .nodes()
+            .iter()
+            .filter(|(_, n)| n.state() == crate::raft::state::RaftState::Leader)
+            .map(|(&id, _)| id)
+            .collect();
+        assert_eq!(leaders.len(), 1, "expected one leader, got {leaders:?}");
     }
 }
