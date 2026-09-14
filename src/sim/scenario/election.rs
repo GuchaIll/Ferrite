@@ -106,9 +106,9 @@ pub fn elect_within(seed: u64, max_ticks: u64) -> ElectionScenarioResult {
 #[cfg(test)]
 mod tests {
     use super::{elect_within, run_election_scenario};
+    use crate::raft::RaftNode;
     use crate::raft::state::RaftState;
     use crate::sim::{Simulator, node_rng};
-    use crate::raft::RaftNode;
 
     #[test]
     fn elects_exactly_one_leader_within_600_ticks_for_100_seeds() {
@@ -173,7 +173,11 @@ mod tests {
             .filter(|(_, n)| n.state() == RaftState::Leader)
             .map(|(&id, _)| id)
             .collect();
-        assert_eq!(leaders.len(), 1, "expected stable single leader, got {leaders:?}");
+        assert_eq!(
+            leaders.len(),
+            1,
+            "expected stable single leader, got {leaders:?}"
+        );
     }
 
     #[test]
