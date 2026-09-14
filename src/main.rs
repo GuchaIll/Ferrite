@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ferrite::{
-    cli::{run_init, run_validate, InitArgs, ValidateArgs},
+    cli::{InitArgs, ValidateArgs, run_init, run_validate},
     config::StorageBackend,
 };
 
@@ -137,8 +137,20 @@ fn run() -> anyhow::Result<()> {
             println!("  storage:   {storage_desc}");
         }
 
-        Commands::Init { nodes, dir, base_port, client_port, force } => {
-            let written = run_init(InitArgs { nodes, dir, base_port, client_port, force })?;
+        Commands::Init {
+            nodes,
+            dir,
+            base_port,
+            client_port,
+            force,
+        } => {
+            let written = run_init(InitArgs {
+                nodes,
+                dir,
+                base_port,
+                client_port,
+                force,
+            })?;
             for path in &written {
                 println!("wrote {}", path.display());
             }

@@ -50,9 +50,7 @@ fn parse_id_addr(s: &str) -> Option<(NodeId, SocketAddr)> {
 pub fn parse_peer_flags(flags: &[String]) -> Result<Vec<(NodeId, SocketAddr)>, CliError> {
     flags
         .iter()
-        .map(|s| {
-            parse_id_addr(s).ok_or_else(|| CliError::MalformedPeerFlag { input: s.clone() })
-        })
+        .map(|s| parse_id_addr(s).ok_or_else(|| CliError::MalformedPeerFlag { input: s.clone() }))
         .collect()
 }
 
@@ -61,8 +59,7 @@ pub fn parse_endpoint_flags(flags: &[String]) -> Result<Vec<(NodeId, SocketAddr)
     flags
         .iter()
         .map(|s| {
-            parse_id_addr(s)
-                .ok_or_else(|| CliError::MalformedEndpointFlag { input: s.clone() })
+            parse_id_addr(s).ok_or_else(|| CliError::MalformedEndpointFlag { input: s.clone() })
         })
         .collect()
 }
@@ -99,12 +96,12 @@ pub struct ValidateArgs {
 /// The binary prints the config on success or the error message on failure.
 pub fn run_validate(args: ValidateArgs) -> Result<Config, CliError> {
     let overrides = Overrides {
-        peers:                    parse_peer_flags(&args.peers)?,
-        kv_advertise:             parse_endpoint_flags(&args.client_endpoints)?,
-        heartbeat_interval_ms:    args.heartbeat_interval_ms,
-        rpc_timeout_ms:           args.rpc_timeout_ms,
-        election_timeout_min_ms:  args.election_timeout_min_ms,
-        election_timeout_max_ms:  args.election_timeout_max_ms,
+        peers: parse_peer_flags(&args.peers)?,
+        kv_advertise: parse_endpoint_flags(&args.client_endpoints)?,
+        heartbeat_interval_ms: args.heartbeat_interval_ms,
+        rpc_timeout_ms: args.rpc_timeout_ms,
+        election_timeout_min_ms: args.election_timeout_min_ms,
+        election_timeout_max_ms: args.election_timeout_max_ms,
     };
     Config::load(args.config.as_deref(), overrides).map_err(CliError::Config)
 }
@@ -213,7 +210,8 @@ pub fn run_init(args: InitArgs) -> Result<Vec<PathBuf>, CliError> {
         let kv_bind = &endpoints[idx].1;
         let data_dir = format!("./data/node{node_id}");
 
-        let toml_str = render_node_toml(*node_id, raft_bind, kv_bind, &peers, &endpoints, &data_dir);
+        let toml_str =
+            render_node_toml(*node_id, raft_bind, kv_bind, &peers, &endpoints, &data_dir);
 
         // Validate before touching disk
         Config::from_toml_str(&toml_str, Overrides::default()).map_err(|e| {
@@ -327,7 +325,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // First init a cluster so we have a valid file to read
-        run_init(InitArgs { nodes: 1, dir: dir.clone(), ..Default::default() }).unwrap();
+        run_init(InitArgs {
+            nodes: 1,
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
 
         let cfg = run_validate(ValidateArgs {
             config: Some(dir.join("node1.toml")),
@@ -359,7 +362,10 @@ mod tests {
         .to_string();
 
         assert!(err.contains("overlaps"), "{err}");
-        assert!(!dir.join("node1.toml").exists(), "no files should be written");
+        assert!(
+            !dir.join("node1.toml").exists(),
+            "no files should be written"
+        );
     }
 
     #[test]
@@ -390,11 +396,22 @@ mod tests {
         let dir = std::env::temp_dir().join("ferrite_init_portmath");
         let _ = std::fs::remove_dir_all(&dir);
 
-        run_init(InitArgs { nodes: 3, dir: dir.clone(), ..Default::default() }).unwrap();
+        run_init(InitArgs {
+            nodes: 3,
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
 
         let node3 = std::fs::read_to_string(dir.join("node3.toml")).unwrap();
-        assert!(node3.contains("7003"), "node3 raft port should be 7003:\n{node3}");
-        assert!(node3.contains("8003"), "node3 kv port should be 8003:\n{node3}");
+        assert!(
+            node3.contains("7003"),
+            "node3 raft port should be 7003:\n{node3}"
+        );
+        assert!(
+            node3.contains("8003"),
+            "node3 kv port should be 8003:\n{node3}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -406,15 +423,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("other.txt"), "existing content").unwrap();
 
-        let err = run_init(InitArgs { nodes: 1, dir: dir.clone(), ..Default::default() })
-            .unwrap_err()
-            .to_string();
+        let err = run_init(InitArgs {
+            nodes: 1,
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not empty"), "{err}");
 
         // --force should succeed and leave other.txt intact
-        run_init(InitArgs { nodes: 1, dir: dir.clone(), force: true, ..Default::default() })
-            .unwrap();
-        assert!(dir.join("other.txt").exists(), "--force must not remove unrelated files");
+        run_init(InitArgs {
+            nodes: 1,
+            dir: dir.clone(),
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            dir.join("other.txt").exists(),
+            "--force must not remove unrelated files"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -430,7 +459,12 @@ mod tests {
         // proving the file's 3 endpoints were discarded.
         let dir = std::env::temp_dir().join("ferrite_cli_ep_replace");
         let _ = std::fs::remove_dir_all(&dir);
-        run_init(InitArgs { nodes: 3, dir: dir.clone(), ..Default::default() }).unwrap();
+        run_init(InitArgs {
+            nodes: 3,
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
 
         let err = run_validate(ValidateArgs {
             config: Some(dir.join("node1.toml")),
@@ -444,7 +478,8 @@ mod tests {
         // Validation fails because peer ids 2 and 3 have no endpoint — proves
         // the override replaced (not unioned with) the file's client_endpoints.
         assert!(
-            err.contains("missing entry for peer id 2") || err.contains("missing entry for peer id 3"),
+            err.contains("missing entry for peer id 2")
+                || err.contains("missing entry for peer id 3"),
             "expected 'missing entry' error proving replacement, got: {err}"
         );
 
@@ -484,7 +519,9 @@ mod tests {
 
     #[test]
     fn validate_missing_config_path_clear_error() {
-        let err = run_validate(ValidateArgs::default()).unwrap_err().to_string();
+        let err = run_validate(ValidateArgs::default())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("no configuration source") || err.contains("--config"),
             "{err}"
@@ -496,8 +533,7 @@ mod tests {
     #[test]
     fn malformed_toml_returns_toml_error() {
         use crate::config::{Config, ConfigError, Overrides};
-        let err = Config::from_toml_str("[[[ not valid toml", Overrides::default())
-            .unwrap_err();
+        let err = Config::from_toml_str("[[[ not valid toml", Overrides::default()).unwrap_err();
         assert!(
             matches!(err, ConfigError::Toml(_)),
             "expected ConfigError::Toml, got: {err:?}"
@@ -535,7 +571,12 @@ mod tests {
         let dir = std::env::temp_dir().join("ferrite_init_identical_peers");
         let _ = std::fs::remove_dir_all(&dir);
 
-        run_init(InitArgs { nodes: 3, dir: dir.clone(), ..Default::default() }).unwrap();
+        run_init(InitArgs {
+            nodes: 3,
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .unwrap();
 
         // All three files must have all three peers
         for i in 1..=3u64 {

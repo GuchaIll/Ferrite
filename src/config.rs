@@ -130,8 +130,8 @@ pub const MAX_TIMING_MS: u64 = 600_000;
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
-            heartbeat_interval:   Duration::from_millis(DEFAULT_HEARTBEAT_MS),
-            rpc_timeout:          Duration::from_millis(DEFAULT_RPC_TIMEOUT_MS),
+            heartbeat_interval: Duration::from_millis(DEFAULT_HEARTBEAT_MS),
+            rpc_timeout: Duration::from_millis(DEFAULT_RPC_TIMEOUT_MS),
             election_timeout_min: Duration::from_millis(DEFAULT_ELECTION_TIMEOUT_MIN_MS),
             election_timeout_max: Duration::from_millis(DEFAULT_ELECTION_TIMEOUT_MAX_MS),
             compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
@@ -177,7 +177,7 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cluster: ClusterConfig,
-    pub raft:    RaftConfig,
+    pub raft: RaftConfig,
     pub storage: StorageConfig,
     pub logging: LoggingConfig,
 }
@@ -240,8 +240,7 @@ impl Config {
         let mut raw = match path {
             Some(p) => {
                 let text = std::fs::read_to_string(p)?;
-                toml::from_str::<RawConfig>(&text)
-                    .map_err(|e| ConfigError::Toml(e.to_string()))?
+                toml::from_str::<RawConfig>(&text).map_err(|e| ConfigError::Toml(e.to_string()))?
             }
             None => {
                 // Overrides currently cover peers/endpoints/timings only — not node_id or binds.
@@ -269,9 +268,7 @@ impl Config {
         let missing_file = path.is_none();
         apply_overrides(&mut raw, overrides);
         let mut result = validate(raw);
-        if missing_file
-            && let Err(ConfigError::Validation { ref mut errors }) = result
-        {
+        if missing_file && let Err(ConfigError::Validation { ref mut errors }) = result {
             errors.insert(
                 0,
                 "no --config path: Overrides cannot supply node_id/listen_addr/client_addr yet; \
@@ -285,8 +282,8 @@ impl Config {
     /// Parse and validate a TOML string directly. Used by `ferrite init` to validate
     /// generated node files before writing them to disk.
     pub fn from_toml_str(toml: &str, overrides: Overrides) -> Result<Config, ConfigError> {
-        let mut raw = toml::from_str::<RawConfig>(toml)
-            .map_err(|e| ConfigError::Toml(e.to_string()))?;
+        let mut raw =
+            toml::from_str::<RawConfig>(toml).map_err(|e| ConfigError::Toml(e.to_string()))?;
         apply_overrides(&mut raw, overrides);
         validate(raw)
     }
@@ -324,16 +321,16 @@ struct RawClusterConfig {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct RawRaftConfig {
-    heartbeat_interval_ms:   Option<u64>,
-    rpc_timeout_ms:          Option<u64>,
+    heartbeat_interval_ms: Option<u64>,
+    rpc_timeout_ms: Option<u64>,
     election_timeout_min_ms: Option<u64>,
     election_timeout_max_ms: Option<u64>,
-    compaction_threshold:    Option<u64>,
+    compaction_threshold: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct RawStorageConfig {
-    backend:  Option<String>, // "memory" | "disk"
+    backend: Option<String>, // "memory" | "disk"
     data_dir: Option<String>,
 }
 
@@ -359,22 +356,40 @@ struct RawConfig {
 fn apply_overrides(raw: &mut RawConfig, overrides: Overrides) {
     if !overrides.peers.is_empty() {
         raw.cluster.peers = Some(
-            overrides.peers.into_iter()
-                .map(|(id, addr)| RawPeer { id, addr: addr.to_string() })
+            overrides
+                .peers
+                .into_iter()
+                .map(|(id, addr)| RawPeer {
+                    id,
+                    addr: addr.to_string(),
+                })
                 .collect(),
         );
     }
     if !overrides.kv_advertise.is_empty() {
         raw.cluster.client_endpoints = Some(
-            overrides.kv_advertise.into_iter()
-                .map(|(id, addr)| RawEndpoint { id, addr: addr.to_string() })
+            overrides
+                .kv_advertise
+                .into_iter()
+                .map(|(id, addr)| RawEndpoint {
+                    id,
+                    addr: addr.to_string(),
+                })
                 .collect(),
         );
     }
-    if let Some(v) = overrides.heartbeat_interval_ms   { raw.raft.heartbeat_interval_ms   = Some(v); }
-    if let Some(v) = overrides.rpc_timeout_ms           { raw.raft.rpc_timeout_ms           = Some(v); }
-    if let Some(v) = overrides.election_timeout_min_ms  { raw.raft.election_timeout_min_ms  = Some(v); }
-    if let Some(v) = overrides.election_timeout_max_ms  { raw.raft.election_timeout_max_ms  = Some(v); }
+    if let Some(v) = overrides.heartbeat_interval_ms {
+        raw.raft.heartbeat_interval_ms = Some(v);
+    }
+    if let Some(v) = overrides.rpc_timeout_ms {
+        raw.raft.rpc_timeout_ms = Some(v);
+    }
+    if let Some(v) = overrides.election_timeout_min_ms {
+        raw.raft.election_timeout_min_ms = Some(v);
+    }
+    if let Some(v) = overrides.election_timeout_max_ms {
+        raw.raft.election_timeout_max_ms = Some(v);
+    }
 }
 
 // ── Validation: Raw → Config ──────────────────────────────────────────────────
@@ -385,11 +400,23 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     let mut errors: Vec<String> = Vec::new();
 
     // ── Timing ────────────────────────────────────────────────────────────
-    let hb_ms   = raw.raft.heartbeat_interval_ms  .unwrap_or(DEFAULT_HEARTBEAT_MS);
-    let rpc_ms  = raw.raft.rpc_timeout_ms          .unwrap_or(DEFAULT_RPC_TIMEOUT_MS);
-    let emin    = raw.raft.election_timeout_min_ms .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MIN_MS);
-    let emax    = raw.raft.election_timeout_max_ms .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MAX_MS);
-    let cthresh = raw.raft.compaction_threshold    .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
+    let hb_ms = raw
+        .raft
+        .heartbeat_interval_ms
+        .unwrap_or(DEFAULT_HEARTBEAT_MS);
+    let rpc_ms = raw.raft.rpc_timeout_ms.unwrap_or(DEFAULT_RPC_TIMEOUT_MS);
+    let emin = raw
+        .raft
+        .election_timeout_min_ms
+        .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MIN_MS);
+    let emax = raw
+        .raft
+        .election_timeout_max_ms
+        .unwrap_or(DEFAULT_ELECTION_TIMEOUT_MAX_MS);
+    let cthresh = raw
+        .raft
+        .compaction_threshold
+        .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
 
     if hb_ms == 0 {
         errors.push("raft.heartbeat_interval_ms: must not be 0".into());
@@ -447,8 +474,14 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
 
     // ── node_id ───────────────────────────────────────────────────────────
     let node_id = match raw.cluster.node_id {
-        None    => { errors.push("cluster.node_id: required".into()); 0 }
-        Some(0) => { errors.push("cluster.node_id: must not be 0".into()); 0 }
+        None => {
+            errors.push("cluster.node_id: required".into());
+            0
+        }
+        Some(0) => {
+            errors.push("cluster.node_id: must not be 0".into());
+            0
+        }
         Some(id) => id,
     };
 
@@ -489,14 +522,16 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             Ok(a) => a,
             Err(e) => {
                 errors.push(format!(
-                    "cluster.peers[{}].addr: invalid address {:?}: {e}", rp.id, rp.addr
+                    "cluster.peers[{}].addr: invalid address {:?}: {e}",
+                    rp.id, rp.addr
                 ));
                 continue;
             }
         };
         if let Some(existing) = seen_peer_addrs.get(&addr) {
             errors.push(format!(
-                "cluster.peers: duplicate addr {addr} (ids {existing} and {})", rp.id
+                "cluster.peers: duplicate addr {addr} (ids {existing} and {})",
+                rp.id
             ));
             continue;
         }
@@ -514,7 +549,9 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
 
     // node_id must appear in peers
     if node_id != 0 && !peers.is_empty() && !peers.contains_key(&node_id) {
-        errors.push(format!("cluster.node_id ({node_id}) is absent from cluster.peers"));
+        errors.push(format!(
+            "cluster.node_id ({node_id}) is absent from cluster.peers"
+        ));
     }
 
     // raft_bind must match peers[node_id].addr
@@ -545,14 +582,16 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             Ok(a) => a,
             Err(e) => {
                 errors.push(format!(
-                    "cluster.client_endpoints[{}].addr: invalid address {:?}: {e}", re.id, re.addr
+                    "cluster.client_endpoints[{}].addr: invalid address {:?}: {e}",
+                    re.id, re.addr
                 ));
                 continue;
             }
         };
         if let Some(existing) = seen_ep_addrs.get(&addr) {
             errors.push(format!(
-                "cluster.client_endpoints: duplicate addr {addr} (ids {existing} and {})", re.id
+                "cluster.client_endpoints: duplicate addr {addr} (ids {existing} and {})",
+                re.id
             ));
             continue;
         }
@@ -612,9 +651,7 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
                 },
             },
             None => {
-                errors.push(
-                    "storage.data_dir: required when storage.backend = \"disk\"".into(),
-                );
+                errors.push("storage.data_dir: required when storage.backend = \"disk\"".into());
                 StorageConfig::default()
             }
         },
@@ -635,8 +672,12 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
 
     // ── Logging ───────────────────────────────────────────────────────────
     let logging = match raw.logging.format.as_deref() {
-        None | Some("pretty") => LoggingConfig { format: LogFormat::Pretty },
-        Some("json")          => LoggingConfig { format: LogFormat::Json },
+        None | Some("pretty") => LoggingConfig {
+            format: LogFormat::Pretty,
+        },
+        Some("json") => LoggingConfig {
+            format: LogFormat::Json,
+        },
         Some(other) => {
             errors.push(format!(
                 "logging.format: unknown value {other:?}; expected \"pretty\" or \"json\""
@@ -669,8 +710,8 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
             kv_advertise,
         },
         raft: RaftConfig {
-            heartbeat_interval:   Duration::from_millis(hb_ms),
-            rpc_timeout:          Duration::from_millis(rpc_ms),
+            heartbeat_interval: Duration::from_millis(hb_ms),
+            rpc_timeout: Duration::from_millis(rpc_ms),
             election_timeout_min: Duration::from_millis(emin),
             election_timeout_max: Duration::from_millis(emax),
             compaction_threshold: cthresh,
@@ -715,17 +756,35 @@ mod tests {
                 listen_addr: Some("127.0.0.1:7001".into()),
                 client_addr: Some("127.0.0.1:8001".into()),
                 peers: Some(vec![
-                    RawPeer { id: 1, addr: "127.0.0.1:7001".into() },
-                    RawPeer { id: 2, addr: "127.0.0.1:7002".into() },
-                    RawPeer { id: 3, addr: "127.0.0.1:7003".into() },
+                    RawPeer {
+                        id: 1,
+                        addr: "127.0.0.1:7001".into(),
+                    },
+                    RawPeer {
+                        id: 2,
+                        addr: "127.0.0.1:7002".into(),
+                    },
+                    RawPeer {
+                        id: 3,
+                        addr: "127.0.0.1:7003".into(),
+                    },
                 ]),
                 client_endpoints: Some(vec![
-                    RawEndpoint { id: 1, addr: "127.0.0.1:8001".into() },
-                    RawEndpoint { id: 2, addr: "127.0.0.1:8002".into() },
-                    RawEndpoint { id: 3, addr: "127.0.0.1:8003".into() },
+                    RawEndpoint {
+                        id: 1,
+                        addr: "127.0.0.1:8001".into(),
+                    },
+                    RawEndpoint {
+                        id: 2,
+                        addr: "127.0.0.1:8002".into(),
+                    },
+                    RawEndpoint {
+                        id: 3,
+                        addr: "127.0.0.1:8003".into(),
+                    },
                 ]),
             },
-            raft:    RawRaftConfig::default(),
+            raft: RawRaftConfig::default(),
             storage: RawStorageConfig::default(),
             logging: RawLoggingConfig::default(),
         }
@@ -750,9 +809,18 @@ mod tests {
     fn btreemap_peers_keys_sorted() {
         let mut raw = three_node_raw();
         raw.cluster.peers = Some(vec![
-            RawPeer { id: 3, addr: "127.0.0.1:7003".into() },
-            RawPeer { id: 1, addr: "127.0.0.1:7001".into() },
-            RawPeer { id: 2, addr: "127.0.0.1:7002".into() },
+            RawPeer {
+                id: 3,
+                addr: "127.0.0.1:7003".into(),
+            },
+            RawPeer {
+                id: 1,
+                addr: "127.0.0.1:7001".into(),
+            },
+            RawPeer {
+                id: 2,
+                addr: "127.0.0.1:7002".into(),
+            },
         ]);
         let cfg = validate(raw).unwrap();
         let keys: Vec<NodeId> = cfg.cluster.peers.keys().copied().collect();
@@ -763,9 +831,18 @@ mod tests {
     fn btreemap_kv_advertise_keys_sorted() {
         let mut raw = three_node_raw();
         raw.cluster.client_endpoints = Some(vec![
-            RawEndpoint { id: 3, addr: "127.0.0.1:8003".into() },
-            RawEndpoint { id: 1, addr: "127.0.0.1:8001".into() },
-            RawEndpoint { id: 2, addr: "127.0.0.1:8002".into() },
+            RawEndpoint {
+                id: 3,
+                addr: "127.0.0.1:8003".into(),
+            },
+            RawEndpoint {
+                id: 1,
+                addr: "127.0.0.1:8001".into(),
+            },
+            RawEndpoint {
+                id: 2,
+                addr: "127.0.0.1:8002".into(),
+            },
         ]);
         let cfg = validate(raw).unwrap();
         let keys: Vec<NodeId> = cfg.cluster.kv_advertise.keys().copied().collect();
@@ -778,8 +855,14 @@ mod tests {
         raw.raft.rpc_timeout_ms = Some(400);
         raw.raft.election_timeout_min_ms = Some(300);
         let err = validate(raw).unwrap_err().to_string();
-        assert!(err.contains("rpc_timeout_ms"), "error should name rpc_timeout_ms: {err}");
-        assert!(err.contains("election_timeout_min_ms"), "error should name election_timeout_min_ms: {err}");
+        assert!(
+            err.contains("rpc_timeout_ms"),
+            "error should name rpc_timeout_ms: {err}"
+        );
+        assert!(
+            err.contains("election_timeout_min_ms"),
+            "error should name election_timeout_min_ms: {err}"
+        );
     }
 
     #[test]
@@ -804,9 +887,18 @@ mod tests {
     fn raft_and_kv_addr_collision_rejected() {
         let mut raw = three_node_raw();
         raw.cluster.client_endpoints = Some(vec![
-            RawEndpoint { id: 1, addr: "127.0.0.1:8001".into() },
-            RawEndpoint { id: 2, addr: "127.0.0.1:7002".into() }, // ← same as Raft peer 2
-            RawEndpoint { id: 3, addr: "127.0.0.1:8003".into() },
+            RawEndpoint {
+                id: 1,
+                addr: "127.0.0.1:8001".into(),
+            },
+            RawEndpoint {
+                id: 2,
+                addr: "127.0.0.1:7002".into(),
+            }, // ← same as Raft peer 2
+            RawEndpoint {
+                id: 3,
+                addr: "127.0.0.1:8003".into(),
+            },
         ]);
         let err = validate(raw).unwrap_err().to_string();
         assert!(err.contains("collides"), "{err}");
@@ -816,8 +908,14 @@ mod tests {
     fn missing_client_endpoint_for_peer_rejected() {
         let mut raw = three_node_raw();
         raw.cluster.client_endpoints = Some(vec![
-            RawEndpoint { id: 1, addr: "127.0.0.1:8001".into() },
-            RawEndpoint { id: 2, addr: "127.0.0.1:8002".into() },
+            RawEndpoint {
+                id: 1,
+                addr: "127.0.0.1:8001".into(),
+            },
+            RawEndpoint {
+                id: 2,
+                addr: "127.0.0.1:8002".into(),
+            },
             // id 3 missing
         ]);
         let err = validate(raw).unwrap_err().to_string();
@@ -833,7 +931,11 @@ mod tests {
             ..Default::default()
         };
         apply_overrides(&mut raw, overrides);
-        assert_eq!(raw.cluster.peers.as_ref().unwrap().len(), 1, "override should replace, not union");
+        assert_eq!(
+            raw.cluster.peers.as_ref().unwrap().len(),
+            1,
+            "override should replace, not union"
+        );
     }
 
     #[test]
@@ -1107,7 +1209,10 @@ addr = "127.0.0.1:8003"
             },
         ]);
         let err = validate(raw).unwrap_err().to_string();
-        assert!(err.contains("duplicate address") || err.contains("7001"), "{err}");
+        assert!(
+            err.contains("duplicate address") || err.contains("7001"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1132,7 +1237,10 @@ addr = "127.0.0.1:8003"
             },
         ]);
         let err = validate(raw).unwrap_err().to_string();
-        assert!(err.contains("id 0 is reserved") || err.contains("id: 0"), "{err}");
+        assert!(
+            err.contains("id 0 is reserved") || err.contains("id: 0"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1206,7 +1314,9 @@ addr = "127.0.0.1:8003"
 
     #[test]
     fn load_path_none_no_flags_clear_error() {
-        let err = Config::load(None, Overrides::default()).unwrap_err().to_string();
+        let err = Config::load(None, Overrides::default())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("no configuration source") || err.contains("--config"),
             "{err}"
