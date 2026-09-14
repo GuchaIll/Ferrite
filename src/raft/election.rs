@@ -11,8 +11,8 @@ use rand::{Rng, RngCore};
 use crate::{
     config::NodeId,
     raft::{
-        AppendEntriesRequest, AppendEntriesResponse, RaftNode, RaftRpc, RequestVoteRequest,
-        RequestVoteResponse, state::RaftState, storage::HardState,
+        AppendEntriesRequest, RaftNode, RaftRpc, RequestVoteRequest, RequestVoteResponse,
+        state::RaftState, storage::HardState,
     },
 };
 
@@ -23,6 +23,7 @@ pub enum ElectionAction {
     Send { to: NodeId, rpc: RaftRpc },
     PromoteLeader,
     DemoteFollower,
+    RedirectLeader { leader_hint: Option<NodeId> },
 }
 
 /// Volatile election state for one Raft node.
@@ -75,11 +76,7 @@ pub(crate) fn reset_timeout(
     let lo = *range.start();
     let hi = *range.end();
     // Inclusive range; gen_range needs lo < hi or lo..=lo style.
-    let timeout = if lo >= hi {
-        lo
-    } else {
-        rng.gen_range(lo..=hi)
-    };
+    let timeout = if lo >= hi { lo } else { rng.gen_range(lo..=hi) };
     state.set_election_timeout(timeout);
 }
 
@@ -161,7 +158,7 @@ pub(crate) fn handle_request_vote_request(
     actions
 }
 
-fn persist_hard_state(node: &RaftNode) -> ElectionAction {
+pub(crate) fn persist_hard_state(node: &RaftNode) -> ElectionAction {
     ElectionAction::Persist(HardState {
         current_term: node.current_term,
         voted_for: node.voted_for,
@@ -176,10 +173,7 @@ pub(crate) fn handle_request_vote_response(
 ) -> Vec<ElectionAction> {
     if response.term > node.current_term {
         become_follower(node, response.term);
-        return vec![
-            ElectionAction::DemoteFollower,
-            persist_hard_state(node),
-        ];
+        return vec![ElectionAction::DemoteFollower, persist_hard_state(node)];
     }
 
     if node.state == RaftState::Candidate
@@ -190,52 +184,6 @@ pub(crate) fn handle_request_vote_response(
     }
 
     Vec::new()
-}
-
-/// Minimal AppendEntries handling sufficient for election stability.
-///
-/// Heartbeats reset the election timer and establish leader identity. Log
-/// matching / entry append remain out of scope for issue #9.
-pub(crate) fn handle_append_entries_request(
-    node: &mut RaftNode,
-    from: NodeId,
-    request: AppendEntriesRequest,
-) -> Vec<ElectionAction> {
-    let mut actions = Vec::new();
-
-    if request.term > node.current_term {
-        become_follower(node, request.term);
-        actions.push(persist_hard_state(node));
-    }
-
-    if request.term < node.current_term {
-        actions.push(ElectionAction::Send {
-            to: from,
-            rpc: RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
-                term: node.current_term,
-                success: false,
-            }),
-        });
-        return actions;
-    }
-
-    // Same term: accept leader authority and suppress elections.
-    if node.state != RaftState::Follower {
-        node.state = RaftState::Follower;
-        actions.push(ElectionAction::DemoteFollower);
-    }
-    node.leader_id = Some(request.leader_id);
-    node.election.reset();
-
-    actions.push(ElectionAction::Send {
-        to: from,
-        rpc: RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
-            term: node.current_term,
-            success: true,
-        }),
-    });
-
-    actions
 }
 
 pub(crate) fn become_follower(node: &mut RaftNode, term: u64) {
@@ -277,18 +225,6 @@ fn become_leader(node: &mut RaftNode) -> Vec<ElectionAction> {
 
     node.heartbeat_ticks = node.heartbeat_interval_ticks;
     actions
-}
-
-pub(crate) fn observe_term(node: &mut RaftNode, observed_term: u64) -> Vec<ElectionAction> {
-    if observed_term > node.current_term {
-        become_follower(node, observed_term);
-        vec![
-            ElectionAction::DemoteFollower,
-            persist_hard_state(node),
-        ]
-    } else {
-        Vec::new()
-    }
 }
 
 fn start_election(node: &mut RaftNode) -> Vec<ElectionAction> {
