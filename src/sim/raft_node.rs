@@ -1,9 +1,9 @@
 //! Deterministic-simulation adapter for the Raft state machine.
 
 use crate::{
-    config::NodeId, raft::{RaftNode, election::ElectionAction},
+    config::NodeId,
+    raft::{RaftNode, election::ElectionAction},
 };
-
 
 use super::{Input, Output, SimNode};
 
@@ -21,10 +21,7 @@ impl SimNode for RaftNode {
         let actions = match input {
             Input::Tick => self.on_tick(),
             Input::Message { from, rpc } => self.handle_rpc(from, rpc),
-            Input::ClientCommand(command) => {
-                self.handle_client_command(command);
-                Vec::new()
-            }
+            Input::ClientCommand(command) => self.handle_client_command(command),
         };
         actions_to_outputs(actions)
     }
@@ -37,9 +34,10 @@ fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
         .filter_map(|action| match action {
             ElectionAction::Persist(hard_state) => Some(Output::Persist(hard_state)),
             ElectionAction::Send { to, rpc } => Some(Output::Send { to, rpc }),
-            //State already mutated in Raft core
-            ElectionAction::PromoteLeader => None,    
-            ElectionAction::DemoteFollower => None
+            // Role / redirect effects are already reflected in Raft core state.
+            ElectionAction::PromoteLeader
+            | ElectionAction::DemoteFollower
+            | ElectionAction::RedirectLeader { .. } => None,
         })
         .collect()
 }
@@ -47,7 +45,7 @@ fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{RaftRpc, RequestVoteRequest, RequestVoteResponse, HardState};
+    use crate::raft::{HardState, RaftRpc, RequestVoteRequest, RequestVoteResponse};
 
     #[test]
     fn tick_with_expired_timeout_persists_and_sends_request_votes() {
@@ -82,7 +80,13 @@ mod tests {
         });
 
         // Persist before reply (term/vote), then Send response.
-        assert!(matches!(outs.first(), Some(Output::Persist(HardState { current_term: 1, voted_for: Some(2) }))));
+        assert!(matches!(
+            outs.first(),
+            Some(Output::Persist(HardState {
+                current_term: 1,
+                voted_for: Some(2)
+            }))
+        ));
         assert!(matches!(
             outs.get(1),
             Some(Output::Send {
