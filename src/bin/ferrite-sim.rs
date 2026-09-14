@@ -4,9 +4,9 @@
 //! ferrite-sim run --scenario election --seed N [--ticks 600]
 //! ```
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use ferrite::sim::scenario::{elect_within, run_election_scenario};
+use ferrite::sim::scenario::{elect_within, run_election_scenario, run_replicate_scenario};
 
 #[derive(Debug, Parser)]
 #[command(name = "ferrite-sim", about = "Deterministic Ferrite simulator")]
@@ -19,7 +19,7 @@ struct Cli {
 enum Commands {
     /// Run a named scenario.
     Run {
-        /// Scenario name (currently: `election`).
+        /// Scenario name (`election` or `replicate`).
         #[arg(long)]
         scenario: String,
 
@@ -57,7 +57,23 @@ fn main() -> Result<()> {
                 let _ = run_election_scenario(seed, result.ticks_run);
                 Ok(())
             }
-            other => bail!("unknown scenario '{other}' (supported: election)"),
+            "replicate" => {
+                let result = run_replicate_scenario(seed, 100);
+                println!(
+                    "scenario=replicate seed={seed} leader={:?} writes={} log_len={} identical={}",
+                    result.leader_id, result.writes, result.log_len, result.logs_identical
+                );
+                if !result.logs_identical || result.log_len != 100 {
+                    bail!(
+                        "replicate failed: identical={} log_len={}",
+                        result.logs_identical,
+                        result.log_len
+                    );
+                }
+                let _ = ticks; // election budget is internal; CLI ticks unused here
+                Ok(())
+            }
+            other => bail!("unknown scenario '{other}' (supported: election, replicate)"),
         },
     }
 }
