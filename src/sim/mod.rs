@@ -253,6 +253,19 @@ impl<N: SimNode> Simulator<N> {
     pub fn persisted(&self) -> &BTreeMap<NodeId, crate::raft::HardState> {
         &self.persisted
     }
+
+    /// Delivers one input to `node_id` at the current tick and drains effects.
+    ///
+    /// Used by scenarios to inject client commands without advancing the clock.
+    pub fn step_node(&mut self, node_id: NodeId, input: Input) {
+        let tick = self.clock.now();
+        let Some(node) = self.nodes.get_mut(&node_id) else {
+            return;
+        };
+        let outputs = node.step(input);
+        self.drain_outputs(tick, node_id, outputs);
+        self.deliver_pending(tick);
+    }
 }
 
 #[cfg(test)]
@@ -377,30 +390,21 @@ mod tests {
 
     #[test]
     fn delivers_send_outputs_as_messages_same_tick() {
-        let mut simulator = Simulator::new(
-            1,
-            vec![
-                BounceNode { id: 1 },
-                BounceNode { id: 2 },
-            ],
-        );
+        let mut simulator = Simulator::new(1, vec![BounceNode { id: 1 }, BounceNode { id: 2 }]);
 
         let trace = simulator.run(1);
         let kinds: Vec<_> = trace
             .events()
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind(),
-                    TraceEventKind::Send | TraceEventKind::Deliver
-                )
-            })
+            .filter(|e| matches!(e.kind(), TraceEventKind::Send | TraceEventKind::Deliver))
             .map(|e| (e.kind(), e.node()))
             .collect();
 
         // Node 1 sends RequestVote → deliver to 2 → 2 replies → deliver to 1.
         assert!(
-            kinds.iter().any(|(k, n)| *k == TraceEventKind::Send && *n == Some(1)),
+            kinds
+                .iter()
+                .any(|(k, n)| *k == TraceEventKind::Send && *n == Some(1)),
             "expected send from 1, got {kinds:?}"
         );
         assert!(
@@ -410,7 +414,9 @@ mod tests {
             "expected deliver to 2, got {kinds:?}"
         );
         assert!(
-            kinds.iter().any(|(k, n)| *k == TraceEventKind::Send && *n == Some(2)),
+            kinds
+                .iter()
+                .any(|(k, n)| *k == TraceEventKind::Send && *n == Some(2)),
             "expected reply send from 2, got {kinds:?}"
         );
         assert!(
