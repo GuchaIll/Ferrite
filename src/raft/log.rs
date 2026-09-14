@@ -221,7 +221,7 @@ impl RaftLog {
             });
 
         if let Some(position) = first_to_append {
-            self.truncate_from(incoming[position].index);
+            self.truncate_from(incoming[position].index)?;
 
             for entry in &incoming[position..] {
                 self.append(entry.clone())?;
@@ -231,10 +231,23 @@ impl RaftLog {
     }
 
     /// Removes every entry whose index is at least `index`.
-    pub fn truncate_from(&mut self, index: u64) {
+    ///
+    /// An `index` below [`RaftLog::start_index`] is rejected rather than
+    /// clamped: those entries are covered by a snapshot, and truncating there
+    /// would silently discard the entire log. `expected` carries the lowest
+    /// index this log can legally truncate at.
+    pub fn truncate_from(&mut self, index: u64) -> Result<(), LogIndexError> {
+        if index < self.start_index {
+            return Err(LogIndexError {
+                expected: self.start_index,
+                actual: index,
+            });
+        }
+
         let length = index.saturating_sub(self.start_index);
         let length = usize::try_from(length).unwrap_or(usize::MAX);
         self.entries.truncate(length);
+        Ok(())
     }
 
     fn validate_contiguous(entries: &[LogEntry]) -> Result<(), LogIndexError> {
@@ -426,6 +439,67 @@ mod tests {
         );
         assert_eq!(log.entries_from(1), vec![entry(1, 1, b"one")]);
     }
+
+    #[test]
+    fn truncate_below_the_start_index_is_rejected() {
+        let mut log = RaftLog::new();
+        for item in [
+            entry(1, 1, b"one"),
+            entry(2, 1, b"two"),
+            entry(3, 2, b"three"),
+        ] {
+            log.append(item).unwrap();
+        }
+        log.compact(2);
+
+        assert_eq!(
+            log.truncate_from(1),
+            Err(LogIndexError {
+                expected: 3,
+                actual: 1,
+            })
+        );
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.entry(3).unwrap().command, b"three");
+    }
+
+    #[test]
+    fn truncate_from_the_zero_sentinel_is_rejected() {
+        let mut log = RaftLog::new();
+        log.append(entry(1, 1, b"one")).unwrap();
+
+        assert_eq!(
+            log.truncate_from(0),
+            Err(LogIndexError {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(log.entries_from(1), vec![entry(1, 1, b"one")]);
+    }
+
+    #[test]
+    fn leader_batch_below_the_start_index_does_not_wipe_the_log() {
+        let mut log = RaftLog::new();
+        for item in [
+            entry(1, 1, b"one"),
+            entry(2, 1, b"two"),
+            entry(3, 2, b"three"),
+        ] {
+            log.append(item).unwrap();
+        }
+        log.compact(2);
+
+        assert_eq!(
+            log.append_from_leader(&[entry(1, 9, b"stale")]),
+            Err(LogIndexError {
+                expected: 3,
+                actual: 1,
+            })
+        );
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.entry(3).unwrap().command, b"three");
+    }
 }
 
 #[cfg(test)]
@@ -481,12 +555,13 @@ mod property_tests {
         #[test]
         fn truncate_from_removes_exactly_the_suffix(
             entries in arb_entries(),
-            cut_index in 0u64..40,
+            cut_index in 1u64..40,
         ) {
             let mut log = build_log(&entries);
             let len = entries.len() as u64;
 
-            log.truncate_from(cut_index);
+            log.truncate_from(cut_index)
+                .expect("an uncompacted log truncates at any index from 1");
 
             let kept = cut_index.saturating_sub(1).min(len);
             prop_assert_eq!(log.last_index(), kept);
