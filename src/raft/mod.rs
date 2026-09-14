@@ -7,6 +7,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::config::NodeId;
 
 pub mod election;
+pub mod invariant;
 pub mod log;
 pub mod replication;
 pub mod snapshot;
@@ -202,34 +203,24 @@ impl RaftNode {
         if self.state == RaftState::Leader {
             self.heartbeat_ticks = self.heartbeat_ticks.saturating_sub(1);
             if self.heartbeat_ticks == 0 {
-                let actions = self.heartbeat_actions();
                 self.heartbeat_ticks = self.heartbeat_interval_ticks;
-                return actions;
+                return replication::heartbeat_actions(self);
             }
-            return Vec::new();
+
+            // Opportunistic catch-up when a follower is behind between heartbeats.
+            return self
+                .peers
+                .iter()
+                .copied()
+                .filter(|&peer| peer != self.id)
+                .filter(|peer| {
+                    let next = self.next_index.get(peer).copied().unwrap_or(1);
+                    self.log.last_index() >= next
+                })
+                .map(|peer| replication::send_append_entries(self, peer))
+                .collect();
         }
         election::on_tick(self)
-    }
-
-    fn heartbeat_actions(&self) -> Vec<election::ElectionAction> {
-        let prev = self.log.last_index();
-        let prev_term = self.log.last_term();
-
-        self.peers
-            .iter()
-            .filter(|&&peer| peer != self.id)
-            .map(|&to| election::ElectionAction::Send {
-                to,
-                rpc: RaftRpc::AppendEntries(AppendEntriesRequest {
-                    term: self.current_term,
-                    leader_id: self.id,
-                    prev_log_index: prev,
-                    prev_log_term: prev_term,
-                    entries: Vec::new(),
-                    leader_commit: self.commit_index,
-                }),
-            })
-            .collect()
     }
 
     /// Handles an RPC delivered by a runtime adapter.
@@ -246,14 +237,26 @@ impl RaftNode {
                 election::handle_request_vote_response(self, from, res)
             }
             RaftRpc::AppendEntries(req) => {
-                election::handle_append_entries_request(self, from, req)
+                replication::handle_append_entries_request(self, from, req)
             }
-            RaftRpc::AppendEntriesResponse(res) => election::observe_term(self, res.term),
+            RaftRpc::AppendEntriesResponse(res) => {
+                replication::handle_append_entries_response(self, from, res)
+            }
         }
     }
 
     /// Handles a serialized client command delivered by a runtime adapter.
-    pub(crate) fn handle_client_command(&mut self, _command: Vec<u8>) {}
+    pub(crate) fn handle_client_command(
+        &mut self,
+        command: Vec<u8>,
+    ) -> Vec<election::ElectionAction> {
+        replication::append_and_replicate(self, command)
+    }
+
+    /// Returns a shared view of the in-memory Raft log (sim/tests).
+    pub fn log(&self) -> &RaftLog {
+        &self.log
+    }
 }
 
 #[cfg(test)]
