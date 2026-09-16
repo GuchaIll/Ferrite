@@ -53,7 +53,7 @@ pub fn node_rng(root_seed: u64, node_id: NodeId) -> ChaCha8Rng {
     ];
     let mut seed = [0_u8; 32];
 
-    for (chunk, input) in seed.chunks_exact_mut(8).zip(inputs) {
+    for (chunk, input) in seed.as_chunks_mut::<8>().0.iter_mut().zip(inputs) {
         chunk.copy_from_slice(&splitmix64(input).to_le_bytes());
     }
 
