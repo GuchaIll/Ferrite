@@ -1,0 +1,4 @@
+# Golden/canonical fixtures are compared byte-for-byte in tests via
+# include_str!; they must stay LF regardless of core.autocrlf, or Windows
+# checkouts fail canonical-trace comparisons against CRLF-converted files.
+src/sim/*.txt text eol=lf
