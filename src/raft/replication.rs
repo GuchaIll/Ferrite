@@ -31,7 +31,7 @@ pub(crate) fn handle_append_entries_request(
     }
 
     if req.term < node.current_term {
-        actions.push(append_entries_reply(from, node.current_term, false));
+        actions.push(append_entries_reply(from, node.current_term, false, 0));
         return actions;
     }
 
@@ -45,14 +45,14 @@ pub(crate) fn handle_append_entries_request(
 
     // Consistency check: missing or mismatched prev entry → reject, no truncate.
     if !node.log.contains(req.prev_log_index, req.prev_log_term) {
-        actions.push(append_entries_reply(from, node.current_term, false));
+        actions.push(append_entries_reply(from, node.current_term, false, 0));
         return actions;
     }
 
     // append_from_leader validates contiguity first, then truncates only at the
     // first conflicting index (exact-match prefix is retained / no-op).
     if node.log.append_from_leader(&req.entries).is_err() {
-        actions.push(append_entries_reply(from, node.current_term, false));
+        actions.push(append_entries_reply(from, node.current_term, false, 0));
         return actions;
     }
 
@@ -61,15 +61,17 @@ pub(crate) fn handle_append_entries_request(
         node.commit_index = req.leader_commit.min(node.log.last_index());
     }
 
-    actions.push(append_entries_reply(from, node.current_term, true));
+    let ack = req.prev_log_index + req.entries.len() as u64;
+    actions.push(append_entries_reply(from, node.current_term, true, ack));
     actions
 }
 
 /// Handles an AppendEntries response on the leader.
 ///
-/// Success advances `match_index`/`next_index` for the follower. Failure
-/// decrements `next_index` and retries — the minimal catch-up needed so a
-/// single-entry replicate path can converge (optimized backoff is issue #9).
+/// `match_index` is pessimistic evidence: advanced only on an acknowledged
+/// match, never speculatively. `next_index` is optimistic: initialised to the
+/// leader's log tail and walked back on rejection until the follower's common
+/// prefix is found, then streamed forward entry-by-entry.
 pub(crate) fn handle_append_entries_response(
     node: &mut RaftNode,
     from: NodeId,
@@ -85,21 +87,34 @@ pub(crate) fn handle_append_entries_response(
     }
 
     if resp.success {
-        // Any success in this simplified path means the follower now holds our
-        // full log prefix (we always send entries_from(next_index)).
-        let matched = node.log.last_index();
+        // Advance match_index/next_index using the acknowledged index the
+        // follower reported — never assume our own log.last_index() matches.
+        let matched = resp.match_index;
+        debug_assert!(
+            matched <= node.log.last_index(),
+            "follower {from} acked match_index {matched} beyond leader last_index {}",
+            node.log.last_index()
+        );
         node.match_index.insert(from, matched);
         node.next_index.insert(from, matched.saturating_add(1));
         return Vec::new();
     }
 
     // Rejected: step next_index back one and retry immediately.
+    // Floor at start_index so a compacted log never sends an impossible prev.
     let current_next = node
         .next_index
         .get(&from)
         .copied()
         .unwrap_or_else(|| node.log.next_index());
-    let new_next = current_next.saturating_sub(1).max(1);
+    let new_next = current_next
+        .saturating_sub(1)
+        .max(node.log.start_index());
+    debug_assert!(
+        new_next >= node.log.start_index(),
+        "next_index for {from} would fall below log start_index {}",
+        node.log.start_index()
+    );
     node.next_index.insert(from, new_next);
 
     vec![send_append_entries(node, from)]
@@ -166,10 +181,14 @@ fn next_index_for(node: &RaftNode, peer: NodeId) -> u64 {
         .unwrap_or_else(|| node.log.next_index())
 }
 
-fn append_entries_reply(to: NodeId, term: u64, success: bool) -> ElectionAction {
+fn append_entries_reply(to: NodeId, term: u64, success: bool, match_index: u64) -> ElectionAction {
     ElectionAction::Send {
         to,
-        rpc: RaftRpc::AppendEntriesResponse(AppendEntriesResponse { term, success }),
+        rpc: RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
+            term,
+            success,
+            match_index,
+        }),
     }
 }
 
@@ -407,6 +426,7 @@ mod tests {
                 rpc: RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
                     term: 5,
                     success: false,
+                    ..
                 }),
                 ..
             })
@@ -443,6 +463,108 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].command, b"cmd");
         }
+    }
+
+    // ── handle_append_entries_response: backoff walk ──────────────────────
+
+    fn ae_response(term: u64, success: bool, match_index: u64) -> AppendEntriesResponse {
+        AppendEntriesResponse {
+            term,
+            success,
+            match_index,
+        }
+    }
+
+    #[test]
+    fn success_response_advances_match_and_next_index() {
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
+        node.next_index.insert(2, 4);
+        node.match_index.insert(2, 0);
+
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(1, true, 3));
+
+        assert!(actions.is_empty());
+        assert_eq!(node.match_index[&2], 3);
+        assert_eq!(node.next_index[&2], 4);
+    }
+
+    #[test]
+    fn rejection_decrements_next_index_and_sends_retry() {
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
+        node.next_index.insert(2, 4);
+        node.match_index.insert(2, 0);
+
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(1, false, 0));
+
+        assert_eq!(node.next_index[&2], 3);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            ElectionAction::Send {
+                to: 2,
+                rpc: RaftRpc::AppendEntries(_),
+            }
+        )));
+    }
+
+    #[test]
+    fn next_index_floors_at_log_start_on_repeated_rejection() {
+        let mut node = leader_with_log(&[(1, 1, b"a")]);
+        node.next_index.insert(2, 1);
+        node.match_index.insert(2, 0);
+
+        // next_index is already at 1; rejection must not push it below 1.
+        handle_append_entries_response(&mut node, 2, ae_response(1, false, 0));
+        assert_eq!(node.next_index[&2], 1);
+    }
+
+    #[test]
+    fn backoff_walk_decrements_step_by_step_until_floored() {
+        let mut node = leader_with_log(&[
+            (1, 1, b"a"),
+            (2, 1, b"b"),
+            (3, 1, b"c"),
+            (4, 1, b"d"),
+            (5, 1, b"e"),
+        ]);
+        // next_index[2] is already 6 after leader_with_log; override to make explicit.
+        node.next_index.insert(2, 6);
+
+        // Five rejections walk next_index: 6 → 5 → 4 → 3 → 2 → 1.
+        for expected_next in (1u64..=5).rev() {
+            handle_append_entries_response(&mut node, 2, ae_response(1, false, 0));
+            assert_eq!(node.next_index[&2], expected_next, "after rejection");
+        }
+        // Floored at log start (1): further rejections must not push it below 1.
+        handle_append_entries_response(&mut node, 2, ae_response(1, false, 0));
+        assert_eq!(node.next_index[&2], 1);
+    }
+
+    #[test]
+    fn higher_term_in_response_demotes_leader() {
+        let mut node = leader_with_log(&[(1, 1, b"a")]);
+
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(5, false, 0));
+
+        assert_eq!(node.current_term, 5);
+        assert_eq!(node.state, RaftState::Follower);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ElectionAction::DemoteFollower)));
+    }
+
+    #[test]
+    fn stale_term_response_is_ignored() {
+        let mut node = leader_with_log(&[(1, 3, b"a")]);
+        node.next_index.insert(2, 2);
+        let before_match = node.match_index[&2];
+        let before_next = node.next_index[&2];
+
+        // Response from an old term — must be a no-op.
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(1, true, 1));
+
+        assert!(actions.is_empty());
+        assert_eq!(node.match_index[&2], before_match);
+        assert_eq!(node.next_index[&2], before_next);
     }
 
     #[test]
