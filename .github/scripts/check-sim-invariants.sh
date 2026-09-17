@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+if ! command -v rg >/dev/null 2>&1; then
+    echo "ripgrep (rg) is not installed; this gate cannot run without it" >&2
+    exit 1
+fi
+
 sim_dir="src/sim"
 
 fail_if_found() {
