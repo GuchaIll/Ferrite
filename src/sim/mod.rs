@@ -254,6 +254,16 @@ impl<N: SimNode> Simulator<N> {
         &self.persisted
     }
 
+    /// Drops all messages to/from `node_id` until [`Simulator::connect_node`] is called.
+    pub fn isolate_node(&mut self, node_id: NodeId) {
+        self.network.isolate(node_id);
+    }
+
+    /// Restores message delivery for `node_id`.
+    pub fn connect_node(&mut self, node_id: NodeId) {
+        self.network.connect(node_id);
+    }
+
     /// Delivers one input to `node_id` at the current tick and drains effects.
     ///
     /// Used by scenarios to inject client commands without advancing the clock.

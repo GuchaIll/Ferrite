@@ -3,7 +3,7 @@
 //! Same-tick, reliable, ordered delivery. Partition/loss/delay can layer on
 //! later without changing the driver contract.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::{config::NodeId, raft::RaftRpc};
 
@@ -19,6 +19,8 @@ pub struct InFlight {
 #[derive(Debug, Default)]
 pub struct Network {
     queue: VecDeque<InFlight>,
+    /// Nodes whose inbound and outbound messages are silently dropped.
+    isolated: BTreeSet<NodeId>,
 }
 
 impl Network {
@@ -27,8 +29,23 @@ impl Network {
         Self::default()
     }
 
+    /// Drops all messages to or from `node_id` until [`Network::connect`] is called.
+    pub fn isolate(&mut self, node_id: NodeId) {
+        self.isolated.insert(node_id);
+    }
+
+    /// Restores delivery for `node_id`.
+    pub fn connect(&mut self, node_id: NodeId) {
+        self.isolated.remove(&node_id);
+    }
+
     /// Enqueues an RPC for later delivery (FIFO).
+    ///
+    /// Silently drops the message if either endpoint is currently isolated.
     pub fn enqueue(&mut self, from: NodeId, to: NodeId, rpc: RaftRpc) {
+        if self.isolated.contains(&from) || self.isolated.contains(&to) {
+            return;
+        }
         self.queue.push_back(InFlight { from, to, rpc });
     }
 
