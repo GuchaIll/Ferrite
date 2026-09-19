@@ -174,6 +174,9 @@ pub fn run_lagging_follower_scenario(seed: u64, writes: u64) -> LaggingFollowerR
 mod tests {
     use super::{run_lagging_follower_scenario, run_replicate_scenario};
 
+    /// A newly elected leader appends one current-term no-op before client writes.
+    const LEADER_NOOP_ENTRIES: u64 = 1;
+
     #[test]
     fn replicate_100_writes_identical_logs_for_20_seeds() {
         for seed in 0..20 {
@@ -183,7 +186,11 @@ mod tests {
                 "seed {seed}: logs diverged (len={})",
                 result.log_len
             );
-            assert_eq!(result.log_len, 100, "seed {seed}: expected 100 entries");
+            assert_eq!(
+                result.log_len,
+                100 + LEADER_NOOP_ENTRIES,
+                "seed {seed}: expected 100 client entries plus the leader no-op"
+            );
         }
     }
 
@@ -197,7 +204,11 @@ mod tests {
                 "seed {seed}: logs diverged (len={})",
                 result.log_len
             );
-            assert_eq!(result.log_len, 100, "seed {seed}: expected 100 entries");
+            assert_eq!(
+                result.log_len,
+                100 + LEADER_NOOP_ENTRIES,
+                "seed {seed}: expected 100 client entries plus the leader no-op"
+            );
         }
     }
 
@@ -218,8 +229,9 @@ mod tests {
                 result.lagging_node, result.log_len
             );
             assert_eq!(
-                result.log_len, 50,
-                "seed {seed}: expected 50 entries, got {}",
+                result.log_len,
+                50 + LEADER_NOOP_ENTRIES,
+                "seed {seed}: expected 50 client entries plus the leader no-op, got {}",
                 result.log_len
             );
         }
