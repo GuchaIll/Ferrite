@@ -61,6 +61,9 @@ pub(crate) fn handle_append_entries_request(
         node.commit_index = req.leader_commit.min(node.log.last_index());
     }
 
+    // §5.3 apply rule: emit Apply for each newly committed index, in order.
+    actions.extend(apply_committed(node));
+
     let ack = req.prev_log_index + req.entries.len() as u64;
     actions.push(append_entries_reply(from, node.current_term, true, ack));
     actions
@@ -95,9 +98,19 @@ pub(crate) fn handle_append_entries_response(
             "follower {from} acked match_index {matched} beyond leader last_index {}",
             node.log.last_index()
         );
-        node.match_index.insert(from, matched);
-        node.next_index.insert(from, matched.saturating_add(1));
-        return Vec::new();
+        // Never move match_index backwards on a stale success reply.
+        let prev_match = node.match_index.get(&from).copied().unwrap_or(0);
+        if matched > prev_match {
+            node.match_index.insert(from, matched);
+            node.next_index.insert(from, matched.saturating_add(1));
+        }
+
+        // §5.3 / §5.4.2: commit the highest index replicated on a majority,
+        // but only if that entry was created in the leader's current term.
+        maybe_advance_commit_index(node);
+
+        // Apply is separate from commit: drain last_applied..commit_index.
+        return apply_committed(node);
     }
 
     // Rejected: step next_index back one and retry immediately.
@@ -107,9 +120,7 @@ pub(crate) fn handle_append_entries_response(
         .get(&from)
         .copied()
         .unwrap_or_else(|| node.log.next_index());
-    let new_next = current_next
-        .saturating_sub(1)
-        .max(node.log.start_index());
+    let new_next = current_next.saturating_sub(1).max(node.log.start_index());
     debug_assert!(
         new_next >= node.log.start_index(),
         "next_index for {from} would fall below log start_index {}",
@@ -179,6 +190,71 @@ fn next_index_for(node: &RaftNode, peer: NodeId) -> u64 {
         .get(&peer)
         .copied()
         .unwrap_or_else(|| node.log.next_index())
+}
+
+/// Leader §5.3 / §5.4.2 commit rule.
+///
+/// 1. Build a vector of every replica's matched index, treating the leader as
+///    matched through `log.last_index()` (it holds its own log).
+/// 2. Sort descending; the majority index is `matches[quorum - 1]` — at least
+///    `quorum` nodes have `match_index >= N`.
+/// 3. Advance `commit_index` to that N **only if** `log[N].term == current_term`.
+///    Previous-term entries become committed only indirectly once a current-term
+///    entry is committed (Figure 8).
+fn maybe_advance_commit_index(node: &mut RaftNode) {
+    // Cluster size = self + other peers listed in `peers` that are not self.
+    // `peers` may or may not include `id`; count uniquely either way.
+    let cluster_size = 1 + node.peers.iter().filter(|&&p| p != node.id).count();
+    let quorum = cluster_size / 2 + 1;
+
+    let mut matches: Vec<u64> = node
+        .peers
+        .iter()
+        .filter(|&&p| p != node.id)
+        .map(|&p| node.match_index.get(&p).copied().unwrap_or(0))
+        .collect();
+    // Leader always "matches" its own last index.
+    matches.push(node.log.last_index());
+    matches.sort_unstable_by(|a, b| b.cmp(a)); // descending
+
+    let Some(&n) = matches.get(quorum - 1) else {
+        return;
+    };
+    if n <= node.commit_index {
+        return;
+    }
+
+    // Figure 8 / §5.4.2: never commit a previous-term entry by majority alone.
+    match node.log.term_at(n) {
+        Ok(term) if term == node.current_term => {
+            node.commit_index = n;
+        }
+        _ => {}
+    }
+}
+
+/// §5.3 state-machine apply rule.
+///
+/// Whenever `commit_index` advances (leader quorum or follower `leaderCommit`),
+/// emit one [`ElectionAction::ApplyCommittedEntries`] per index in
+/// `(last_applied, commit_index]`, then bump `last_applied`. Never skips, never
+/// repeats: `last_applied` is the exclusive high-water mark of applied entries.
+fn apply_committed(node: &mut RaftNode) -> Vec<ElectionAction> {
+    let mut actions = Vec::new();
+    while node.last_applied < node.commit_index {
+        let next = node.last_applied.saturating_add(1);
+        let Ok(entry) = node.log.entry(next) else {
+            // commit_index should never point past a missing/compacted entry;
+            // stop rather than inventing an apply.
+            break;
+        };
+        // Clone justified: the driver owns the Apply effect; the log keeps its copy.
+        actions.push(ElectionAction::ApplyCommittedEntries {
+            entry: entry.clone(),
+        });
+        node.last_applied = next;
+    }
+    actions
 }
 
 fn append_entries_reply(to: NodeId, term: u64, success: bool, match_index: u64) -> ElectionAction {
@@ -480,12 +556,318 @@ mod tests {
         let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
         node.next_index.insert(2, 4);
         node.match_index.insert(2, 0);
+        // Hold commit back so this test only covers match/next bookkeeping.
+        // (A second peer still at 0 means quorum N can still be 3 via leader+peer2;
+        // pin last_applied == commit after a deliberate non-quorum scenario by
+        // pre-setting commit_index high enough that maybe_advance is a no-op.)
+        node.commit_index = 3;
+        node.last_applied = 3;
 
         let actions = handle_append_entries_response(&mut node, 2, ae_response(1, true, 3));
 
         assert!(actions.is_empty());
         assert_eq!(node.match_index[&2], 3);
         assert_eq!(node.next_index[&2], 4);
+    }
+
+    #[test]
+    fn quorum_of_current_term_acks_advances_commit_index() {
+        // 3-node cluster: leader + one follower at index 3 is a majority.
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
+        node.current_term = 1;
+        node.commit_index = 0;
+        node.match_index.insert(2, 0);
+        node.match_index.insert(3, 0);
+
+        handle_append_entries_response(&mut node, 2, ae_response(1, true, 3));
+
+        // matches = [leader=3, peer2=3, peer3=0] → majority N = 3, term 1 == current.
+        assert_eq!(node.commit_index, 3);
+        assert_eq!(node.last_applied, 3);
+    }
+
+    #[test]
+    fn single_follower_ack_without_quorum_does_not_commit() {
+        // 5-node cluster needs 3 votes; leader + one ack is not enough.
+        let mut node = RaftNode::new(1, vec![2, 3, 4, 5]);
+        node.state = RaftState::Leader;
+        node.current_term = 1;
+        node.leader_id = Some(1);
+        for &(index, term, cmd) in &[(1u64, 1u64, b"a" as &[u8]), (2, 1, b"b")] {
+            node.log
+                .append(LogEntry::new(index, term, cmd.to_vec()))
+                .unwrap();
+        }
+        for p in [2u64, 3, 4, 5] {
+            node.match_index.insert(p, 0);
+            node.next_index.insert(p, 3);
+        }
+
+        handle_append_entries_response(&mut node, 2, ae_response(1, true, 2));
+
+        // matches = [2, 2, 0, 0, 0] sorted desc → majority (3rd) = 0.
+        assert_eq!(node.commit_index, 0);
+        assert_eq!(node.match_index[&2], 2);
+    }
+
+    #[test]
+    fn majority_of_previous_term_entries_does_not_advance_commit() {
+        // Figure 8 / §5.4.2: old-term entries must not commit by counting alone.
+        // Leader elected in term 3, still holding unreplicated term-2 suffix.
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 2, b"old"), (3, 2, b"old2")]);
+        node.current_term = 3;
+        node.commit_index = 1; // index 1 (term 1) already committed
+        node.match_index.insert(2, 0);
+        node.match_index.insert(3, 0);
+
+        handle_append_entries_response(&mut node, 2, ae_response(3, true, 3));
+
+        // Majority holds index 3, but log[3].term == 2 != current_term 3.
+        assert_eq!(node.commit_index, 1);
+        assert_eq!(node.match_index[&2], 3);
+    }
+
+    #[test]
+    fn committing_current_term_entry_indirectly_commits_prior_terms() {
+        // Same setup as Figure 8, then leader appends a term-3 no-op / write and
+        // gets a majority on that new index → commit jumps over old terms.
+        let mut node = leader_with_log(&[
+            (1, 1, b"a"),
+            (2, 2, b"old"),
+            (3, 2, b"old2"),
+            (4, 3, b"new"),
+        ]);
+        node.current_term = 3;
+        node.commit_index = 1;
+        node.match_index.insert(2, 0);
+        node.match_index.insert(3, 0);
+
+        handle_append_entries_response(&mut node, 2, ae_response(3, true, 4));
+
+        // majority N = 4, log[4].term == 3 == current_term → commit_index = 4
+        // (entries 2 and 3 become committed indirectly).
+        assert_eq!(node.commit_index, 4);
+        // last_applied was 0 by default; apply drains 1..=4 (including prior terms).
+        assert_eq!(node.last_applied, 4);
+    }
+
+    #[test]
+    fn leader_quorum_commit_emits_apply_in_index_order() {
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
+        node.current_term = 1;
+        node.commit_index = 0;
+        node.last_applied = 0;
+        node.match_index.insert(2, 0);
+        node.match_index.insert(3, 0);
+
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(1, true, 3));
+
+        assert_eq!(node.commit_index, 3);
+        assert_eq!(node.last_applied, 3);
+        let applied: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::ApplyCommittedEntries { entry } => Some(entry.index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn leader_apply_is_idempotent_across_successive_acks() {
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
+        node.current_term = 1;
+        node.commit_index = 0;
+        node.last_applied = 0;
+        node.match_index.insert(2, 0);
+        node.match_index.insert(3, 0);
+
+        let first = handle_append_entries_response(&mut node, 2, ae_response(1, true, 2));
+        assert_eq!(node.last_applied, 2);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|a| matches!(a, ElectionAction::ApplyCommittedEntries { .. }))
+                .count(),
+            2
+        );
+
+        // Peer 3 catches up to the same index — commit already at 2, no re-apply.
+        let second = handle_append_entries_response(&mut node, 3, ae_response(1, true, 2));
+        assert_eq!(node.last_applied, 2);
+        assert!(
+            second
+                .iter()
+                .all(|a| !matches!(a, ElectionAction::ApplyCommittedEntries { .. }))
+        );
+    }
+
+    #[test]
+    fn follower_leader_commit_emits_apply_up_to_local_log() {
+        let mut node = follower();
+        node.current_term = 1;
+        for e in [
+            LogEntry::new(1, 1, b"a".to_vec()),
+            LogEntry::new(2, 1, b"b".to_vec()),
+            LogEntry::new(3, 1, b"c".to_vec()),
+        ] {
+            node.log.append(e).unwrap();
+        }
+        node.commit_index = 0;
+        node.last_applied = 0;
+
+        // Heartbeat carrying leaderCommit=2, no new entries.
+        let mut req = ae(1, 3, 1, vec![]);
+        req.leader_commit = 2;
+        // prev must match: last entry is index 3 term 1
+        req.prev_log_index = 3;
+        req.prev_log_term = 1;
+
+        let actions = handle_append_entries_request(&mut node, 1, req);
+
+        assert_eq!(node.commit_index, 2);
+        assert_eq!(node.last_applied, 2);
+        let applied: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::ApplyCommittedEntries { entry } => {
+                    Some((entry.index, entry.command.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, vec![(1, b"a".to_vec()), (2, b"b".to_vec())]);
+    }
+
+    #[test]
+    fn follower_caps_commit_and_apply_at_local_last_index() {
+        let mut node = follower();
+        node.current_term = 1;
+        node.log.append(LogEntry::new(1, 1, b"a".to_vec())).unwrap();
+        node.commit_index = 0;
+        node.last_applied = 0;
+
+        // Leader claims commit 5, but follower only has index 1.
+        let mut req = ae(1, 1, 1, vec![]);
+        req.leader_commit = 5;
+        req.prev_log_index = 1;
+        req.prev_log_term = 1;
+
+        let actions = handle_append_entries_request(&mut node, 1, req);
+
+        assert_eq!(node.commit_index, 1);
+        assert_eq!(node.last_applied, 1);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, ElectionAction::ApplyCommittedEntries { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn apply_drains_only_the_newly_committed_suffix() {
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c"), (4, 1, b"d")]);
+        node.current_term = 1;
+        // Indexes 1..=2 already applied; commit advances to 4.
+        node.commit_index = 2;
+        node.last_applied = 2;
+        node.match_index.insert(2, 0);
+        node.match_index.insert(3, 0);
+
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(1, true, 4));
+
+        assert_eq!(node.commit_index, 4);
+        assert_eq!(node.last_applied, 4);
+        let applied: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::ApplyCommittedEntries { entry } => {
+                    Some((entry.index, entry.command.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, vec![(3, b"c".to_vec()), (4, b"d".to_vec())]);
+    }
+
+    #[test]
+    fn no_apply_when_commit_index_does_not_move() {
+        let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b")]);
+        node.current_term = 1;
+        node.commit_index = 2;
+        node.last_applied = 2;
+        node.match_index.insert(2, 2);
+        node.match_index.insert(3, 0);
+
+        // Stale/duplicate ack of an already-committed index.
+        let actions = handle_append_entries_response(&mut node, 2, ae_response(1, true, 2));
+
+        assert_eq!(node.commit_index, 2);
+        assert_eq!(node.last_applied, 2);
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, ElectionAction::ApplyCommittedEntries { .. }))
+        );
+    }
+
+    #[test]
+    fn follower_partial_apply_then_higher_leader_commit() {
+        let mut node = follower();
+        node.current_term = 1;
+        for e in [
+            LogEntry::new(1, 1, b"a".to_vec()),
+            LogEntry::new(2, 1, b"b".to_vec()),
+            LogEntry::new(3, 1, b"c".to_vec()),
+        ] {
+            node.log.append(e).unwrap();
+        }
+        node.commit_index = 1;
+        node.last_applied = 1;
+
+        let mut req = ae(1, 3, 1, vec![]);
+        req.leader_commit = 3;
+        req.prev_log_index = 3;
+        req.prev_log_term = 1;
+
+        let actions = handle_append_entries_request(&mut node, 1, req);
+
+        assert_eq!(node.commit_index, 3);
+        assert_eq!(node.last_applied, 3);
+        let applied: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::ApplyCommittedEntries { entry } => Some(entry.index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, vec![2, 3]);
+    }
+
+    #[test]
+    fn follower_does_not_reapply_when_leader_commit_unchanged() {
+        let mut node = follower();
+        node.current_term = 1;
+        node.log.append(LogEntry::new(1, 1, b"a".to_vec())).unwrap();
+        node.commit_index = 1;
+        node.last_applied = 1;
+
+        let mut req = ae(1, 1, 1, vec![]);
+        req.leader_commit = 1;
+        req.prev_log_index = 1;
+        req.prev_log_term = 1;
+
+        let actions = handle_append_entries_request(&mut node, 1, req);
+
+        assert_eq!(node.last_applied, 1);
+        assert!(
+            actions
+                .iter()
+                .all(|a| !matches!(a, ElectionAction::ApplyCommittedEntries { .. }))
+        );
     }
 
     #[test]
@@ -547,9 +929,11 @@ mod tests {
 
         assert_eq!(node.current_term, 5);
         assert_eq!(node.state, RaftState::Follower);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ElectionAction::DemoteFollower)));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ElectionAction::DemoteFollower))
+        );
     }
 
     #[test]

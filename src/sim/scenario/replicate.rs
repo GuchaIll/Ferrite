@@ -159,8 +159,7 @@ pub fn run_lagging_follower_scenario(seed: u64, writes: u64) -> LaggingFollowerR
     let first = &logs[0];
     let log_len = first.last_index();
     let logs_identical = logs.iter().all(|log| {
-        log.last_index() == log_len
-            && (1..=log_len).all(|idx| log.entry(idx) == first.entry(idx))
+        log.last_index() == log_len && (1..=log_len).all(|idx| log.entry(idx) == first.entry(idx))
     });
 
     LaggingFollowerResult {
