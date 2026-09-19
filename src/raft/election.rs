@@ -11,7 +11,7 @@ use rand::{Rng, RngCore};
 use crate::{
     config::NodeId,
     raft::{
-        AppendEntriesRequest, RaftNode, RaftRpc, RequestVoteRequest, RequestVoteResponse,
+        LogEntry, RaftNode, RaftRpc, RequestVoteRequest, RequestVoteResponse, replication,
         state::RaftState, storage::HardState,
     },
 };
@@ -20,10 +20,19 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElectionAction {
     Persist(HardState),
-    Send { to: NodeId, rpc: RaftRpc },
+    Send {
+        to: NodeId,
+        rpc: RaftRpc,
+    },
     PromoteLeader,
     DemoteFollower,
-    RedirectLeader { leader_hint: Option<NodeId> },
+    RedirectLeader {
+        leader_hint: Option<NodeId>,
+    },
+    /// One committed log entry to apply to the state machine (index order).
+    ApplyCommittedEntries {
+        entry: LogEntry,
+    },
 }
 
 /// Volatile election state for one Raft node.
@@ -200,30 +209,30 @@ fn become_leader(node: &mut RaftNode) -> Vec<ElectionAction> {
     node.state = RaftState::Leader;
     node.leader_id = Some(node.id);
 
-    // Copy membership once to end the immutable peer-list borrow.
-    let peers = node.peers.clone();
-    let mut actions = vec![ElectionAction::PromoteLeader];
-
-    for peer in peers {
-        let next = node.log.next_index();
-        node.next_index.insert(peer, next);
+    // §5.4.2: a fresh leader cannot count replicas for previous-term entries, so it
+    // appends a no-op in its own term. Committing the no-op transitively commits every
+    // entry before it, which is how the leader learns its real commit point.
+    //
+    // The no-op lands at the end of the log, so each peer's optimistic `next_index`
+    // points at it; `match_index` stays pessimistic at 0 until a peer acknowledges.
+    let noop_index = node.log.next_index();
+    for &peer in &node.peers {
+        node.next_index.insert(peer, noop_index);
         node.match_index.insert(peer, 0);
-
-        let prev = next.saturating_sub(1);
-        actions.push(ElectionAction::Send {
-            to: peer,
-            rpc: RaftRpc::AppendEntries(AppendEntriesRequest {
-                term: node.current_term,
-                leader_id: node.id,
-                prev_log_index: prev,
-                prev_log_term: node.log.term_at(prev).unwrap_or(0),
-                entries: Vec::new(),
-                leader_commit: node.commit_index,
-            }),
-        });
     }
 
+    // `next_index()` is `last_index() + 1`, so this append is contiguous by construction.
+    let appended = node
+        .log
+        .append(LogEntry::new(noop_index, node.current_term, Vec::new()));
+    debug_assert!(
+        appended.is_ok(),
+        "no-op at leader's next_index must be contiguous: {appended:?}"
+    );
+
     node.heartbeat_ticks = node.heartbeat_interval_ticks;
+    let mut actions = vec![ElectionAction::PromoteLeader];
+    actions.extend(replication::broadcast_append_entries(node));
     actions
 }
 
@@ -281,9 +290,205 @@ fn tally_granted_vote(node: &mut RaftNode, from: NodeId) -> Vec<ElectionAction> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ElectionState, is_log_up_to_date, reset_timeout};
+    use super::{
+        ElectionAction, ElectionState, handle_request_vote_response, is_log_up_to_date,
+        reset_timeout,
+    };
+    use crate::raft::{
+        AppendEntriesRequest, LogEntry, RaftNode, RaftRpc, RequestVoteResponse, state::RaftState,
+    };
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+
+    fn candidate_with_self_vote(id: u64, peers: Vec<u64>, term: u64) -> RaftNode {
+        let mut node = RaftNode::new(id, peers);
+        node.current_term = term;
+        node.state = RaftState::Candidate;
+        node.voted_for = Some(id);
+        node.election.votes_granted.clear();
+        node.election.votes_granted.insert(id);
+        node
+    }
+
+    fn vote_ok(term: u64) -> RequestVoteResponse {
+        RequestVoteResponse {
+            term,
+            vote_granted: true,
+        }
+    }
+
+    fn ae_sends(actions: &[ElectionAction]) -> Vec<(u64, &AppendEntriesRequest)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::Send {
+                    to,
+                    rpc: RaftRpc::AppendEntries(req),
+                } => Some((*to, req)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Piece 2: winning an election appends a blank current-term entry and
+    /// replicates it immediately via AppendEntries.
+    #[test]
+    fn become_leader_appends_current_term_noop_and_replicates() {
+        let mut node = candidate_with_self_vote(1, vec![2, 3], 4);
+        // Prior-term residue that cannot commit by majority alone (Figure 8).
+        node.log
+            .append(LogEntry::new(1, 2, b"old".to_vec()))
+            .unwrap();
+        node.log
+            .append(LogEntry::new(2, 3, b"old2".to_vec()))
+            .unwrap();
+        node.commit_index = 0;
+
+        let actions = handle_request_vote_response(&mut node, 2, vote_ok(4));
+
+        assert_eq!(node.state, RaftState::Leader);
+        assert_eq!(node.leader_id, Some(1));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ElectionAction::PromoteLeader))
+        );
+
+        // No-op sits at the tail: empty command, leader's term, index 3.
+        assert_eq!(node.log.last_index(), 3);
+        let noop = node.log.entry(3).unwrap();
+        assert_eq!(noop.term, 4);
+        assert!(noop.command.is_empty());
+        // Prior entries untouched.
+        assert_eq!(node.log.entry(1).unwrap().command, b"old");
+        assert_eq!(node.log.entry(2).unwrap().command, b"old2");
+
+        // next_index points at the no-op; match_index starts at 0.
+        assert_eq!(node.next_index[&2], 3);
+        assert_eq!(node.next_index[&3], 3);
+        assert_eq!(node.match_index[&2], 0);
+        assert_eq!(node.match_index[&3], 0);
+
+        let sends = ae_sends(&actions);
+        assert_eq!(sends.len(), 2, "one AE per peer, got {sends:?}");
+        for (to, req) in sends {
+            assert!(to == 2 || to == 3);
+            assert_eq!(req.term, 4);
+            assert_eq!(req.leader_id, 1);
+            assert_eq!(req.prev_log_index, 2);
+            assert_eq!(req.prev_log_term, 3);
+            assert_eq!(req.leader_commit, 0);
+            assert_eq!(req.entries.len(), 1);
+            assert_eq!(req.entries[0].index, 3);
+            assert_eq!(req.entries[0].term, 4);
+            assert!(req.entries[0].command.is_empty());
+        }
+    }
+
+    #[test]
+    fn become_leader_noop_on_empty_log_starts_at_index_one() {
+        let mut node = candidate_with_self_vote(1, vec![2, 3], 1);
+        let actions = handle_request_vote_response(&mut node, 2, vote_ok(1));
+
+        assert_eq!(node.log.last_index(), 1);
+        let noop = node.log.entry(1).unwrap();
+        assert_eq!(noop.term, 1);
+        assert!(noop.command.is_empty());
+        assert_eq!(node.next_index[&2], 1);
+        assert_eq!(node.match_index[&2], 0);
+
+        let sends = ae_sends(&actions);
+        assert_eq!(sends.len(), 2);
+        for (_to, req) in sends {
+            assert_eq!(req.prev_log_index, 0);
+            assert_eq!(req.prev_log_term, 0);
+            assert_eq!(req.entries, vec![LogEntry::new(1, 1, vec![])]);
+        }
+    }
+
+    #[test]
+    fn single_node_cluster_becomes_leader_with_noop_on_election_start() {
+        // peers empty → self-vote alone is a quorum; start_election → become_leader.
+        let mut node = RaftNode::new(1, vec![]);
+        node.current_term = 0;
+        node.election.set_election_timeout(1);
+        // First tick expires the timer.
+        let actions = super::on_tick(&mut node);
+
+        assert_eq!(node.state, RaftState::Leader);
+        assert_eq!(node.current_term, 1);
+        assert_eq!(node.log.last_index(), 1);
+        assert!(node.log.entry(1).unwrap().command.is_empty());
+        assert_eq!(node.log.entry(1).unwrap().term, 1);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ElectionAction::PromoteLeader))
+        );
+        // No peers → no AppendEntries Sends.
+        assert!(ae_sends(&actions).is_empty());
+    }
+
+    #[test]
+    fn vote_below_quorum_does_not_append_noop() {
+        let mut node = candidate_with_self_vote(1, vec![2, 3, 4, 5], 2);
+        // 5-node cluster needs 3 votes; self + one grant is not enough.
+        let actions = handle_request_vote_response(&mut node, 2, vote_ok(2));
+
+        assert_eq!(node.state, RaftState::Candidate);
+        assert_eq!(node.log.last_index(), 0);
+        assert!(actions.is_empty());
+        assert!(node.next_index.is_empty());
+    }
+
+    /// Piece 2 + 1: after the no-op is majority-acked, commit can advance and
+    /// previous-term entries become committed indirectly.
+    #[test]
+    fn noop_majority_enables_commit_of_prior_term_entries() {
+        use crate::raft::AppendEntriesResponse;
+        use crate::raft::replication::handle_append_entries_response;
+
+        let mut node = candidate_with_self_vote(1, vec![2, 3], 5);
+        node.log.append(LogEntry::new(1, 2, b"a".to_vec())).unwrap();
+        node.log.append(LogEntry::new(2, 4, b"b".to_vec())).unwrap();
+        node.commit_index = 0;
+        node.last_applied = 0;
+
+        handle_request_vote_response(&mut node, 2, vote_ok(5));
+        assert_eq!(node.log.last_index(), 3); // no-op at 3
+        assert_eq!(node.commit_index, 0); // not yet replicated
+
+        // One follower acks through the no-op → majority (leader + peer 2).
+        let actions = handle_append_entries_response(
+            &mut node,
+            2,
+            AppendEntriesResponse {
+                term: 5,
+                success: true,
+                match_index: 3,
+            },
+        );
+
+        assert_eq!(node.commit_index, 3);
+        assert_eq!(node.last_applied, 3);
+        let applied: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::ApplyCommittedEntries { entry } => {
+                    Some((entry.index, entry.term, entry.command.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            applied,
+            vec![
+                (1, 2, b"a".to_vec()),
+                (2, 4, b"b".to_vec()),
+                (3, 5, vec![]), // no-op
+            ]
+        );
+    }
 
     #[test]
     fn reset_uses_the_nodes_selected_timeout() {

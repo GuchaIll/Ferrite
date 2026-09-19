@@ -38,6 +38,7 @@ fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
             ElectionAction::PromoteLeader
             | ElectionAction::DemoteFollower
             | ElectionAction::RedirectLeader { .. } => None,
+            ElectionAction::ApplyCommittedEntries { entry } => Some(Output::Apply(entry)),
         })
         .collect()
 }
