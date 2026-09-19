@@ -53,6 +53,8 @@ pub struct AppendEntriesRequest {
 pub struct AppendEntriesResponse {
     pub term: u64,
     pub success: bool,
+    /// Last log index the responder actually acknowledged (0 on rejection).
+    pub match_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
