@@ -306,7 +306,7 @@ mod tests {
     use super::test_node::EchoNode;
     use super::{Input, Output, SimNode, Simulator, node_rng};
     use crate::{
-        kv::Command,
+        kv::{ClientRequest, Command},
         raft::{RaftNode, RaftRpc, RequestVoteRequest, RequestVoteResponse},
         sim::clock::Clock,
         sim::trace::TraceEventKind,
@@ -618,24 +618,33 @@ mod tests {
         let (mut simulator, leader_id) = elected_raft_cluster(41, node_ids);
         let key = b"cas-key".to_vec();
 
-        let set = Command::Set {
-            key: key.clone(),
-            value: b"before".to_vec(),
-        };
+        let set = ClientRequest::new(
+            1,
+            1,
+            Command::Set {
+                key: key.clone(),
+                value: b"before".to_vec(),
+            },
+        );
         simulator.step_node(
             leader_id,
             Input::ClientCommand(set.encode().expect("encode set")),
         );
         simulator.run(200);
 
-        // Both commands carry version 1. Raft commits them in log order, so
-        // only the first can transition the key to version 2.
-        for value in [b"first".to_vec(), b"second".to_vec()] {
-            let cas = Command::Cas {
-                key: key.clone(),
-                expected_version: Some(1),
-                value: Some(value),
-            };
+        // Two distinct clients race. Both commands carry version 1, and Raft
+        // commits them in log order, so only the first can transition the key to
+        // version 2.
+        for (client_id, value) in [(2, b"first".to_vec()), (3, b"second".to_vec())] {
+            let cas = ClientRequest::new(
+                client_id,
+                1,
+                Command::Cas {
+                    key: key.clone(),
+                    expected_version: Some(1),
+                    value: Some(value),
+                },
+            );
             simulator.step_node(
                 leader_id,
                 Input::ClientCommand(cas.encode().expect("encode CAS")),

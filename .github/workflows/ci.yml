@@ -62,6 +62,8 @@ jobs:
         run: bash .github/scripts/check-sim-invariants.sh
       - name: Check Raft core stays synchronous
         run: bash .github/scripts/check-raft-invariants.sh
+      - name: Check KV state machine determinism
+        run: bash .github/scripts/check-kv-invariants.sh
       - run: cargo test --all-targets --verbose
       - name: Deterministic replay stress test
         run: cargo test --lib sim::tests::same_seed_is_deterministic_for_one_thousand_seeds -- --ignored
