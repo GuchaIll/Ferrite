@@ -72,6 +72,21 @@ jobs:
           cargo clean
           cargo test --lib sim::tests::canonical_trace_matches_golden_fixture
 
+  acceptance:
+    name: 1000-seed Acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - name: Election and replicate acceptance (issues #9, #10)
+        run: >
+          cargo test --release --lib -- --ignored
+          elects_exactly_one_leader_within_600_ticks_for_1000_seeds
+          replicate_100_writes_identical_logs_for_1000_seeds
+
   build:
     name: Build
     runs-on: ubuntu-latest
