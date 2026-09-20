@@ -82,6 +82,9 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
       - name: Election and replicate acceptance (issues #9, #10)
+        # Keep the simulator's invariant hook (gated on debug_assertions) on at release speed.
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
         run: >
           cargo test --release --lib -- --ignored
           elects_exactly_one_leader_within_600_ticks_for_1000_seeds

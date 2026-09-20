@@ -25,7 +25,11 @@ pub mod scenario;
 pub mod test_node;
 pub mod trace;
 
-use crate::{config::NodeId, kv::KvStateMachine};
+use crate::{
+    config::NodeId,
+    kv::KvStateMachine,
+    raft::{RaftNode, invariant::InvariantChecker},
+};
 pub use io::{Input, Output};
 
 /// Synchronous simulated node driven by [`Simulator`].
@@ -35,6 +39,11 @@ pub trait SimNode {
 
     /// Handles one driver input and returns ordered outputs to be drained.
     fn step(&mut self, input: Input) -> Vec<Output>;
+
+    /// Exposes Raft state to the driver's invariant hook; non-Raft nodes opt out.
+    fn raft(&self) -> Option<&RaftNode> {
+        None
+    }
 }
 
 /// Derives a stable, independent ChaCha8 stream for one node.
@@ -78,6 +87,8 @@ pub struct Simulator<N: SimNode> {
     /// Durable hard-state last observed per node (sim-side bookkeeping).
     persisted: BTreeMap<NodeId, crate::raft::HardState>,
     trace: Trace,
+    /// Safety history checked after every step and delivery in debug builds.
+    invariants: InvariantChecker,
 }
 
 impl<N: SimNode> Simulator<N> {
@@ -122,6 +133,7 @@ impl<N: SimNode> Simulator<N> {
             network: Network::new(),
             persisted: BTreeMap::new(),
             trace,
+            invariants: InvariantChecker::new(),
         }
     }
 
@@ -148,6 +160,7 @@ impl<N: SimNode> Simulator<N> {
                     continue;
                 };
                 let outputs = node.step(Input::Tick);
+                self.check_invariants();
                 self.drain_outputs(tick, node_id, outputs);
             }
 
@@ -238,6 +251,7 @@ impl<N: SimNode> Simulator<N> {
                 from: msg.from,
                 rpc: msg.rpc,
             });
+            self.check_invariants();
             self.drain_outputs(tick, msg.to, outputs);
         }
     }
@@ -296,8 +310,17 @@ impl<N: SimNode> Simulator<N> {
             return;
         };
         let outputs = node.step(input);
+        self.check_invariants();
         self.drain_outputs(tick, node_id, outputs);
         self.deliver_pending(tick);
+    }
+
+    /// Asserts Raft safety invariants over every Raft node (debug builds only).
+    fn check_invariants(&mut self) {
+        if cfg!(debug_assertions) {
+            self.invariants
+                .observe(self.nodes.values().filter_map(SimNode::raft));
+        }
     }
 }
 
@@ -662,6 +685,40 @@ mod tests {
             })
             .collect();
         assert!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "invariant hook is compiled out without debug assertions"
+    )]
+    #[should_panic(expected = "vote once violated: node 1 voted for 2 and then 3 in term 1")]
+    fn invariant_hook_catches_an_injected_double_vote() {
+        let ids = [1_u64, 2, 3];
+        let nodes = ids
+            .iter()
+            .map(|&id| {
+                let peers = ids.iter().copied().filter(|&p| p != id).collect();
+                RaftNode::with_rng(id, peers, node_rng(7, id))
+            })
+            .collect();
+        let mut simulator = Simulator::new(7, nodes);
+        simulator.step_node(
+            1,
+            Input::Message {
+                from: 2,
+                rpc: RaftRpc::RequestVote(RequestVoteRequest {
+                    term: 1,
+                    candidate_id: 2,
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            },
+        );
+
+        // Corrupt node 1 behind the protocol's back; the next step must catch it.
+        simulator.nodes.get_mut(&1).expect("node 1").voted_for = Some(3);
+        simulator.run(1);
     }
 
     #[test]

@@ -17,6 +17,10 @@ impl SimNode for RaftNode {
         RaftNode::id(self)
     }
 
+    fn raft(&self) -> Option<&RaftNode> {
+        Some(self)
+    }
+
     fn step(&mut self, input: Input) -> Vec<Output> {
         let actions = match input {
             Input::Tick => self.on_tick(),
