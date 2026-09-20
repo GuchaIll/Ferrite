@@ -134,4 +134,37 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn request_vote_denies_second_candidate_in_same_term() {
+        let mut node = RaftNode::new(1, vec![2, 3]);
+        let request = |candidate_id| Input::Message {
+            from: candidate_id,
+            rpc: RaftRpc::RequestVote(RequestVoteRequest {
+                term: 1,
+                candidate_id,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        };
+        let _ = node.step(request(2));
+
+        let outs = node.step(request(3));
+
+        // Vote Once: no new vote is persisted and candidate 3 is refused.
+        assert!(
+            !outs.iter().any(|o| matches!(o, Output::Persist(_))),
+            "must not persist a second vote in term 1, got {outs:?}"
+        );
+        assert!(matches!(
+            outs.last(),
+            Some(Output::Send {
+                to: 3,
+                rpc: RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    vote_granted: false,
+                }),
+            })
+        ));
+    }
 }
