@@ -27,10 +27,10 @@ impl RaftService for RaftServiceImpl {
         Ok(Response::new(AppendEntriesResponse::default()))
     }
 
-    async fn snapshot(
+    async fn install_snapshot(
         &self,
-        _request: Request<SnapshotRequest>,
-    ) -> Result<Response<SnapshotResponse>, Status> {
-        Ok(Response::new(SnapshotResponse::default()))
+        _request: Request<InstallSnapshotRequest>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        Ok(Response::new(InstallSnapshotResponse::default()))
     }
 }

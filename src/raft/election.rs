@@ -33,6 +33,15 @@ pub enum ElectionAction {
     ApplyCommittedEntries {
         entry: LogEntry,
     },
+    /// Ask the driver for state-machine snapshot bytes at the given index/term.
+    RequestSnapshot {
+        last_included_index: u64,
+        last_included_term: u64,
+    },
+    /// Persist a snapshot before the log prefix it replaces is discarded.
+    PersistSnapshot(crate::raft::snapshot::Snapshot),
+    /// Install snapshot bytes into the application state machine (incl. dedup table).
+    ApplySnapshot(crate::raft::snapshot::Snapshot),
 }
 
 /// Volatile election state for one Raft node.

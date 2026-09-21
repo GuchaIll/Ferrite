@@ -17,6 +17,7 @@ pub mod storage;
 pub use election::ElectionState;
 pub use log::{LogEntry, RaftLog};
 use state::RaftState;
+pub use snapshot::{Snapshot, SnapshotMeta};
 pub use storage::HardState;
 
 const DEFAULT_ELECTION_TIMEOUT_TICKS: u64 = 500;
@@ -58,11 +59,30 @@ pub struct AppendEntriesResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSnapshotRequest {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub done: bool,
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSnapshotResponse {
+    pub term: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaftRpc {
     RequestVote(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntriesRequest),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshotRequest),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +117,10 @@ pub struct RaftNode {
 
     /// Seeded PRNG for election timeout jitter (deterministic under sim seeds).
     pub(crate) rng: ChaCha8Rng,
+
+    pub(crate) compaction_threshold: u64,
+    pub(crate) snapshot: Option<snapshot::Snapshot>,
+    pub(crate) pending_snapshot: Option<snapshot::PendingSnapshot>,
 }
 
 impl PartialEq for RaftNode {
@@ -181,6 +205,10 @@ impl RaftNode {
             election,
             heartbeat_ticks: 0,
             rng,
+            // 0 disables automatic snapshot requests in unit tests without a driver SM.
+            compaction_threshold: 0,
+            snapshot: None,
+            pending_snapshot: None,
         }
     }
 
@@ -203,24 +231,29 @@ impl RaftNode {
     /// Returns ordered effects for the runtime.
     pub(crate) fn on_tick(&mut self) -> Vec<election::ElectionAction> {
         if self.state == RaftState::Leader {
+            let mut actions = Vec::new();
+            if snapshot::should_snapshot(self) {
+                actions.push(snapshot::request_snapshot_action(self));
+            }
+
             self.heartbeat_ticks = self.heartbeat_ticks.saturating_sub(1);
             if self.heartbeat_ticks == 0 {
                 self.heartbeat_ticks = self.heartbeat_interval_ticks;
-                return replication::heartbeat_actions(self);
+                actions.extend(replication::heartbeat_actions(self));
+                return actions;
             }
 
             // Opportunistic catch-up when a follower is behind between heartbeats.
-            return self
-                .peers
-                .iter()
-                .copied()
-                .filter(|&peer| peer != self.id)
-                .filter(|peer| {
-                    let next = self.next_index.get(peer).copied().unwrap_or(1);
-                    self.log.last_index() >= next
-                })
-                .map(|peer| replication::send_append_entries(self, peer))
-                .collect();
+            // Prefer InstallSnapshot when nextIndex cannot be served from the log.
+            for peer in self.peers.iter().copied().filter(|&peer| peer != self.id) {
+                let next = self.next_index.get(&peer).copied().unwrap_or(1);
+                if next <= self.log.last_included_index() {
+                    actions.extend(snapshot::send_install_snapshot(self, peer));
+                } else if self.log.last_index() >= next {
+                    actions.push(replication::send_append_entries(self, peer));
+                }
+            }
+            return actions;
         }
         election::on_tick(self)
     }
@@ -244,6 +277,12 @@ impl RaftNode {
             RaftRpc::AppendEntriesResponse(res) => {
                 replication::handle_append_entries_response(self, from, res)
             }
+            RaftRpc::InstallSnapshot(req) => {
+                snapshot::handle_install_snapshot_request(self, from, req)
+            }
+            RaftRpc::InstallSnapshotResponse(res) => {
+                snapshot::handle_install_snapshot_response(self, from, res)
+            }
         }
     }
 
@@ -253,6 +292,22 @@ impl RaftNode {
         command: Vec<u8>,
     ) -> Vec<election::ElectionAction> {
         replication::append_and_replicate(self, command)
+    }
+
+    /// Handles snapshot bytes produced by the driver after [`ElectionAction::RequestSnapshot`].
+    pub(crate) fn handle_snapshot_taken(
+        &mut self,
+        snapshot: snapshot::Snapshot,
+    ) -> Vec<election::ElectionAction> {
+        snapshot::on_snapshot_taken(self, snapshot)
+    }
+
+    /// Handles driver confirmation that a snapshot is durable (then trims the log).
+    pub(crate) fn handle_snapshot_persisted(
+        &mut self,
+        meta: snapshot::SnapshotMeta,
+    ) -> Vec<election::ElectionAction> {
+        snapshot::on_snapshot_persisted(self, meta)
     }
 
     /// Returns a shared view of the in-memory Raft log (sim/tests).

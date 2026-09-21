@@ -23,6 +23,13 @@ pub enum TransportError {
     Internal(String),
 }
 
+/// Errors produced by durable storage backends.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("storage error: {0}")]
+    Internal(String),
+}
+
 /// Crate-level error, flattening errors from each module.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -34,4 +41,7 @@ pub enum Error {
 
     #[error(transparent)]
     Transport(#[from] TransportError),
+
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }

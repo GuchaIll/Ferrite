@@ -26,12 +26,14 @@ impl SimNode for RaftNode {
             Input::Tick => self.on_tick(),
             Input::Message { from, rpc } => self.handle_rpc(from, rpc),
             Input::ClientCommand(command) => self.handle_client_command(command),
+            Input::SnapshotTaken(snapshot) => self.handle_snapshot_taken(snapshot),
+            Input::SnapshotPersisted(meta) => self.handle_snapshot_persisted(meta),
         };
         actions_to_outputs(actions)
     }
 }
 
-//Core effects -> driver outputs
+// Core effects -> driver outputs
 fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
     actions
         .into_iter()
@@ -43,6 +45,15 @@ fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
             | ElectionAction::DemoteFollower
             | ElectionAction::RedirectLeader { .. } => None,
             ElectionAction::ApplyCommittedEntries { entry } => Some(Output::Apply(entry)),
+            ElectionAction::RequestSnapshot {
+                last_included_index,
+                last_included_term,
+            } => Some(Output::RequestSnapshot {
+                last_included_index,
+                last_included_term,
+            }),
+            ElectionAction::PersistSnapshot(snapshot) => Some(Output::PersistSnapshot(snapshot)),
+            ElectionAction::ApplySnapshot(snapshot) => Some(Output::ApplySnapshot(snapshot)),
         })
         .collect()
 }

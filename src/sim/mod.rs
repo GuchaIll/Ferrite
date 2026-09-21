@@ -201,6 +201,54 @@ impl<N: SimNode> Simulator<N> {
                         tracing::error!(node_id = from, %error, "could not apply committed KV entry");
                     }
                 }
+                Output::RequestSnapshot {
+                    last_included_index,
+                    last_included_term,
+                } => {
+                    // Driver-side snapshot: serialize SM, then feed SnapshotTaken back.
+                    // Issue 03 will make PersistSnapshot durable; for now apply path is local.
+                    let Some(state_machine) = self.state_machines.get(&from) else {
+                        continue;
+                    };
+                    match state_machine.snapshot() {
+                        Ok(data) => {
+                            let snapshot = crate::raft::Snapshot::new(
+                                crate::raft::SnapshotMeta::new(
+                                    last_included_index,
+                                    last_included_term,
+                                ),
+                                data,
+                            );
+                            // Re-enter the node with snapshot bytes in the same drain window
+                            // so compaction can proceed without waiting a tick.
+                            if let Some(node) = self.nodes.get_mut(&from) {
+                                let follow_up = node.step(Input::SnapshotTaken(snapshot));
+                                // Nested drain: PersistSnapshot / etc. before later outputs.
+                                self.drain_outputs(tick, from, follow_up);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(node_id = from, %error, "could not snapshot KV state");
+                        }
+                    }
+                }
+                Output::PersistSnapshot(snapshot) => {
+                    // Issue 03: atomic snapshot persist. Stub acknowledges durability
+                    // immediately so the node can trim the replaced log prefix.
+                    let meta = snapshot.meta;
+                    if let Some(node) = self.nodes.get_mut(&from) {
+                        let follow_up = node.step(Input::SnapshotPersisted(meta));
+                        self.drain_outputs(tick, from, follow_up);
+                    }
+                }
+                Output::ApplySnapshot(snapshot) => {
+                    let Some(state_machine) = self.state_machines.get_mut(&from) else {
+                        continue;
+                    };
+                    if let Err(error) = state_machine.restore(&snapshot.data) {
+                        tracing::error!(node_id = from, %error, "could not restore KV snapshot");
+                    }
+                }
                 Output::Send { to, rpc } => {
                     self.trace.record(TraceEvent::new(
                         tick,
@@ -355,7 +403,10 @@ mod tests {
                     Output::Echo { payload: vec![1] },
                     Output::Echo { payload: vec![2] },
                 ],
-                Input::Message { .. } | Input::ClientCommand(_) => Vec::new(),
+                Input::Message { .. }
+                | Input::ClientCommand(_)
+                | Input::SnapshotTaken(_)
+                | Input::SnapshotPersisted(_) => Vec::new(),
             }
         }
     }

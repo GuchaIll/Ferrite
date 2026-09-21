@@ -52,30 +52,31 @@ message AppendEntriesResponse {
     bool success =2;
 }
 
-//when a follower is so far behind that the elader no logner has the log entries need to catch it up
+//when a follower is so far behind that the leader no longer has the log entries need to catch it up
 //they've been compacted into a snapshot
 
 //sender: leader
 //receiver: lagging follower by id
-//log compact old commited entries into a snapshot. Point in dump of the entrie state machine and
+//log compact old committed entries into a snapshot. Point-in-time dump of the entire state machine and
 //discard the old log entries. Snapshot is sent to lagging follower to catch it up. Snapshot is also used for new nodes joining the cluster
 
-
-message SnapshotRequest {
+// InstallSnapshot is chunked by `offset`. Duplicate/reordered chunks are rejected by the follower.
+message InstallSnapshotRequest {
     uint64 term =1;
     uint64 leader_id =2;
     uint64 last_included_index =3;
     uint64 last_included_term =4;
-    bytes data =5;
-    bool done =6;
+    uint64 offset =5;
+    bytes data =6;
+    bool done =7;
 }
 
-message SnapshotResponse {
+message InstallSnapshotResponse {
     uint64 term =1;
 }
 
 service RaftService {
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
-    rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }

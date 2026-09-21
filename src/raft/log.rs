@@ -86,6 +86,7 @@ pub struct RaftLog {
     /// Index of the oldest entry still held. Entries below this were removed
     /// by [`RaftLog::compact`]; nothing has been compacted while this is 1.
     start_index: u64,
+    last_included_term: u64, //term at start_index - 1, after compaction
 }
 
 impl Default for RaftLog {
@@ -93,6 +94,7 @@ impl Default for RaftLog {
         Self {
             entries: Vec::new(),
             start_index: 1,
+            last_included_term: 0,
         }
     }
 }
@@ -116,13 +118,14 @@ impl RaftLog {
             .map_or(self.start_index.saturating_sub(1), |entry| entry.index)
     }
 
-    /// Returns the last entry term, or zero if the log holds no entries.
+    /// Returns the last entry term.
     ///
-    /// A fully compacted, entry-less log has no way to recover the term of
-    /// its last-included index without snapshot metadata (out of scope
-    /// here), so this returns zero in that case too.
+    /// After compaction leaves an empty suffix, this is the snapshot's
+    /// `last_included_term` rather than zero.
     pub fn last_term(&self) -> u64 {
-        self.entries.last().map_or(0, |entry| entry.term)
+        self.entries
+            .last()
+            .map_or(self.last_included_term, |entry| entry.term)
     }
 
     /// Returns an entry at a one-based Raft index.
@@ -146,12 +149,24 @@ impl RaftLog {
     }
 
     /// Returns the term at `index`; the empty prefix at index zero has term zero.
+    ///
+    /// `term_at(last_included_index)` returns the snapshot's included term so the
+    /// first `AppendEntries` after compaction can still anchor on the boundary.
     pub fn term_at(&self, index: u64) -> Result<u64, LogLookupError> {
         if index == 0 {
-            Ok(0)
-        } else {
-            self.entry(index).map(|entry| entry.term)
+            return Ok(0);
         }
+        // Snapshot boundary: index == start_index - 1 == last_included_index.
+        if index + 1 == self.start_index {
+            return Ok(self.last_included_term);
+        }
+        if index < self.start_index {
+            return Err(LogLookupError::CompactedAway {
+                requested: index,
+                start_index: self.start_index,
+            });
+        }
+        self.entry(index).map(|entry| entry.term)
     }
 
     /// Checks the `prev_log_index` / `prev_log_term` AppendEntries condition.
@@ -177,9 +192,18 @@ impl RaftLog {
         self.entries.get(offset..).unwrap_or_default().to_vec()
     }
 
+    /// Index of the last entry covered by a snapshot (0 before any compaction).
+    pub fn last_included_index(&self) -> u64 {
+        self.start_index.saturating_sub(1)
+    }
+
+    pub fn last_included_term(&self) -> u64 {
+        self.last_included_term
+    }
+
     /// Discards entries at or before `last_included_index`, recording that a
     /// snapshot now covers them. A no-op if nothing new is being compacted.
-    pub fn compact(&mut self, last_included_index: u64) {
+    pub fn compact(&mut self, last_included_index: u64, last_included_term: u64) {
         let new_start = last_included_index.saturating_add(1);
         if new_start <= self.start_index {
             return;
@@ -191,6 +215,21 @@ impl RaftLog {
             .min(self.entries.len());
         self.entries.drain(..discard);
         self.start_index = new_start;
+        self.last_included_term = last_included_term;
+    }
+
+    ///Follower Install: keeping the suffix if (idx, term) matches locally else clear
+    pub fn install_snapshot(&mut self, last_included_index: u64, last_included_term: u64) {
+        if self.contains(last_included_index, last_included_term) {
+            //Boundary matches with local entry; the suffix after is still valid
+            self.compact(last_included_index, last_included_term);
+        }
+        else{
+            //Snapshot superceeds or conflicts with local entry, discard all
+            self.entries.clear();
+            self.start_index = last_included_index.saturating_add(1);
+            self.last_included_term = last_included_term;
+        }
     }
 
     /// Returns the index of the oldest entry still held.
@@ -333,7 +372,7 @@ mod tests {
             log.append(item).unwrap();
         }
 
-        log.compact(2);
+        log.compact(2, 1);
 
         assert_eq!(log.start_index(), 3);
         assert_eq!(log.last_index(), 3);
@@ -450,7 +489,7 @@ mod tests {
         ] {
             log.append(item).unwrap();
         }
-        log.compact(2);
+        log.compact(2, 1);
 
         assert_eq!(
             log.truncate_from(1),
@@ -488,7 +527,7 @@ mod tests {
         ] {
             log.append(item).unwrap();
         }
-        log.compact(2);
+        log.compact(2, 1);
 
         assert_eq!(
             log.append_from_leader(&[entry(1, 9, b"stale")]),
@@ -499,6 +538,77 @@ mod tests {
         );
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.entry(3).unwrap().command, b"three");
+    }
+
+    #[test]
+    fn compacted_boundary_exposes_last_included_term() {
+        let mut log = RaftLog::new();
+        for item in [
+            entry(1, 1, b"one"),
+            entry(2, 2, b"two"),
+            entry(3, 2, b"three"),
+        ] {
+            log.append(item).unwrap();
+        }
+        log.compact(2, 2);
+
+        assert_eq!(log.last_included_index(), 2);
+        assert_eq!(log.last_included_term(), 2);
+        assert_eq!(log.start_index(), 3);
+        assert_eq!(log.term_at(2), Ok(2));
+        assert_eq!(log.last_term(), 2);
+        assert!(log.contains(2, 2));
+    }
+
+    #[test]
+    fn fully_compacted_log_reports_included_term_as_last_term() {
+        let mut log = RaftLog::new();
+        log.append(entry(1, 4, b"one")).unwrap();
+        log.append(entry(2, 5, b"two")).unwrap();
+        log.compact(2, 5);
+
+        assert_eq!(log.start_index(), 3);
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.last_term(), 5);
+        assert_eq!(log.term_at(2), Ok(5));
+    }
+
+    #[test]
+    fn install_snapshot_keeps_matching_suffix() {
+        let mut log = RaftLog::new();
+        for item in [
+            entry(1, 1, b"one"),
+            entry(2, 1, b"two"),
+            entry(3, 2, b"three"),
+            entry(4, 2, b"four"),
+        ] {
+            log.append(item).unwrap();
+        }
+
+        log.install_snapshot(2, 1);
+        assert_eq!(log.start_index(), 3);
+        assert_eq!(
+            log.entries_from(1),
+            vec![entry(3, 2, b"three"), entry(4, 2, b"four")]
+        );
+    }
+
+    #[test]
+    fn install_snapshot_discards_conflicting_log() {
+        let mut log = RaftLog::new();
+        for item in [
+            entry(1, 1, b"one"),
+            entry(2, 9, b"conflict"),
+            entry(3, 9, b"tail"),
+        ] {
+            log.append(item).unwrap();
+        }
+
+        log.install_snapshot(2, 1);
+        assert_eq!(log.start_index(), 3);
+        assert_eq!(log.last_included_term(), 1);
+        assert_eq!(log.last_index(), 2);
+        assert!(log.entry(3).is_err());
     }
 }
 

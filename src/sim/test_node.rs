@@ -32,7 +32,10 @@ impl SimNode for EchoNode {
             Input::Tick => vec![Output::Echo {
                 payload: self.rng.next_u64().to_le_bytes().to_vec(),
             }],
-            Input::Message { .. } | Input::ClientCommand(_) => Vec::new(),
+            Input::Message { .. }
+            | Input::ClientCommand(_)
+            | Input::SnapshotTaken(_)
+            | Input::SnapshotPersisted(_) => Vec::new(),
         }
     }
 }

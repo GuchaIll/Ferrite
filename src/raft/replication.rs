@@ -114,21 +114,23 @@ pub(crate) fn handle_append_entries_response(
     }
 
     // Rejected: step next_index back one and retry immediately.
-    // Floor at start_index so a compacted log never sends an impossible prev.
+    // If nextIndex lands at/below the snapshot boundary, catch_up_peer switches
+    // to InstallSnapshot instead of AppendEntries with a fabricated prev term.
     let current_next = node
         .next_index
         .get(&from)
         .copied()
         .unwrap_or_else(|| node.log.next_index());
-    let new_next = current_next.saturating_sub(1).max(node.log.start_index());
-    debug_assert!(
-        new_next >= node.log.start_index(),
-        "next_index for {from} would fall below log start_index {}",
-        node.log.start_index()
-    );
+    let mut new_next = current_next.saturating_sub(1).max(1);
+    if new_next <= node.log.last_included_index() {
+        // nextIndex on the boundary → InstallSnapshot path in catch_up_peer.
+        new_next = node.log.last_included_index();
+    } else {
+        new_next = new_next.max(node.log.start_index());
+    }
     node.next_index.insert(from, new_next);
 
-    vec![send_append_entries(node, from)]
+    catch_up_peer(node, from)
 }
 
 /// Appends a client command on the leader and replicates to all peers.
@@ -153,12 +155,12 @@ pub(crate) fn append_and_replicate(node: &mut RaftNode, command: Vec<u8>) -> Vec
     broadcast_append_entries(node)
 }
 
-/// Builds one AppendEntries Send for every peer from the leader's `next_index`.
+/// Builds one AppendEntries/InstallSnapshot Send for every peer from the leader's `next_index`.
 pub(crate) fn broadcast_append_entries(node: &RaftNode) -> Vec<ElectionAction> {
     node.peers
         .iter()
         .filter(|&&peer| peer != node.id)
-        .map(|&peer| send_append_entries(node, peer))
+        .flat_map(|&peer| catch_up_peer(node, peer))
         .collect()
 }
 
@@ -171,18 +173,51 @@ pub(crate) fn heartbeat_actions(node: &RaftNode) -> Vec<ElectionAction> {
 
 pub(crate) fn send_append_entries(node: &RaftNode, to: NodeId) -> ElectionAction {
     let next = next_index_for(node, to);
+
+    // Compacted prefix cannot be served via AppendEntries; caller should prefer
+    // InstallSnapshot when nextIndex is at or below last_included_index.
+    debug_assert!(
+        next > node.log.last_included_index(),
+        "AppendEntries prev_log_index would fall below last_included_index {} for peer {to} (next={next})",
+        node.log.last_included_index()
+    );
+
     let prev = next.saturating_sub(1);
+    // term_at resolves index 0 and the snapshot boundary; catch_up_peer must not
+    // call this with prev inside the discarded prefix.
+    let prev_log_term = match node.log.term_at(prev) {
+        Ok(term) => term,
+        Err(_) => {
+            debug_assert!(
+                false,
+                "prev_log_term missing at index {prev} (start_index={})",
+                node.log.start_index()
+            );
+            0
+        }
+    };
+
     ElectionAction::Send {
         to,
         rpc: RaftRpc::AppendEntries(AppendEntriesRequest {
             term: node.current_term,
             leader_id: node.id,
             prev_log_index: prev,
-            prev_log_term: node.log.term_at(prev).unwrap_or(0),
+            prev_log_term,
             entries: node.log.entries_from(next),
             leader_commit: node.commit_index,
         }),
     }
+}
+
+/// Builds the right catch-up RPC for one peer: InstallSnapshot when the log
+/// prefix is gone, otherwise AppendEntries from `next_index`.
+pub(crate) fn catch_up_peer(node: &RaftNode, to: NodeId) -> Vec<ElectionAction> {
+    let next = next_index_for(node, to);
+    if next <= node.log.last_included_index() {
+        return crate::raft::snapshot::send_install_snapshot(node, to);
+    }
+    vec![send_append_entries(node, to)]
 }
 
 fn next_index_for(node: &RaftNode, peer: NodeId) -> u64 {
