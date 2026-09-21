@@ -25,7 +25,11 @@ pub mod scenario;
 pub mod test_node;
 pub mod trace;
 
-use crate::config::NodeId;
+use crate::{
+    config::NodeId,
+    kv::KvStateMachine,
+    raft::{RaftNode, invariant::InvariantChecker},
+};
 pub use io::{Input, Output};
 
 /// Synchronous simulated node driven by [`Simulator`].
@@ -35,6 +39,11 @@ pub trait SimNode {
 
     /// Handles one driver input and returns ordered outputs to be drained.
     fn step(&mut self, input: Input) -> Vec<Output>;
+
+    /// Exposes Raft state to the driver's invariant hook; non-Raft nodes opt out.
+    fn raft(&self) -> Option<&RaftNode> {
+        None
+    }
 }
 
 /// Derives a stable, independent ChaCha8 stream for one node.
@@ -72,10 +81,14 @@ pub struct Simulator<N: SimNode> {
     clock: SimClock,
     root_seed: u64,
     nodes: BTreeMap<NodeId, N>,
+    /// Application state owned by the simulator boundary, one per Raft node.
+    state_machines: BTreeMap<NodeId, KvStateMachine>,
     network: Network,
     /// Durable hard-state last observed per node (sim-side bookkeeping).
     persisted: BTreeMap<NodeId, crate::raft::HardState>,
     trace: Trace,
+    /// Safety history checked after every step and delivery in debug builds.
+    invariants: InvariantChecker,
 }
 
 impl<N: SimNode> Simulator<N> {
@@ -96,6 +109,11 @@ impl<N: SimNode> Simulator<N> {
         }
 
         let node_ids = registered.keys().copied().collect();
+        let state_machines = registered
+            .keys()
+            .copied()
+            .map(|node_id| (node_id, KvStateMachine::new()))
+            .collect();
         let mut trace = Trace::new();
         trace.record(TraceEvent::new(
             0,
@@ -111,9 +129,11 @@ impl<N: SimNode> Simulator<N> {
             clock: SimClock::new(),
             root_seed: seed,
             nodes: registered,
+            state_machines,
             network: Network::new(),
             persisted: BTreeMap::new(),
             trace,
+            invariants: InvariantChecker::new(),
         }
     }
 
@@ -140,6 +160,7 @@ impl<N: SimNode> Simulator<N> {
                     continue;
                 };
                 let outputs = node.step(Input::Tick);
+                self.check_invariants();
                 self.drain_outputs(tick, node_id, outputs);
             }
 
@@ -172,8 +193,13 @@ impl<N: SimNode> Simulator<N> {
                     // future extension. Effects ordering is still enforced by
                     // draining Persist before subsequent Sends in this list.
                 }
-                Output::Apply(_entry) => {
-                    // Application is out of scope for election delivery.
+                Output::Apply(entry) => {
+                    let Some(state_machine) = self.state_machines.get_mut(&from) else {
+                        continue;
+                    };
+                    if let Err(error) = state_machine.apply(&entry) {
+                        tracing::error!(node_id = from, %error, "could not apply committed KV entry");
+                    }
                 }
                 Output::Send { to, rpc } => {
                     self.trace.record(TraceEvent::new(
@@ -225,6 +251,7 @@ impl<N: SimNode> Simulator<N> {
                 from: msg.from,
                 rpc: msg.rpc,
             });
+            self.check_invariants();
             self.drain_outputs(tick, msg.to, outputs);
         }
     }
@@ -247,6 +274,16 @@ impl<N: SimNode> Simulator<N> {
     /// Returns registered nodes in ascending ID order.
     pub fn nodes(&self) -> &BTreeMap<NodeId, N> {
         &self.nodes
+    }
+
+    /// Returns the application state machine owned by `node_id`.
+    pub fn state_machine(&self, node_id: NodeId) -> Option<&KvStateMachine> {
+        self.state_machines.get(&node_id)
+    }
+
+    /// Returns all application state machines in ascending node-ID order.
+    pub fn state_machines(&self) -> &BTreeMap<NodeId, KvStateMachine> {
+        &self.state_machines
     }
 
     /// Returns last-persisted hard state per node (sim bookkeeping).
@@ -273,8 +310,17 @@ impl<N: SimNode> Simulator<N> {
             return;
         };
         let outputs = node.step(input);
+        self.check_invariants();
         self.drain_outputs(tick, node_id, outputs);
         self.deliver_pending(tick);
+    }
+
+    /// Asserts Raft safety invariants over every Raft node (debug builds only).
+    fn check_invariants(&mut self) {
+        if cfg!(debug_assertions) {
+            self.invariants
+                .observe(self.nodes.values().filter_map(SimNode::raft));
+        }
     }
 }
 
@@ -283,6 +329,7 @@ mod tests {
     use super::test_node::EchoNode;
     use super::{Input, Output, SimNode, Simulator, node_rng};
     use crate::{
+        kv::{ClientRequest, Command},
         raft::{RaftNode, RaftRpc, RequestVoteRequest, RequestVoteResponse},
         sim::clock::Clock,
         sim::trace::TraceEventKind,
@@ -557,5 +604,130 @@ mod tests {
             .map(|(&id, _)| id)
             .collect();
         assert_eq!(leaders.len(), 1, "expected one leader, got {leaders:?}");
+    }
+
+    fn elected_raft_cluster(seed: u64, node_ids: &[u64]) -> (Simulator<RaftNode>, u64) {
+        let nodes = node_ids
+            .iter()
+            .copied()
+            .map(|node_id| {
+                let peers = node_ids
+                    .iter()
+                    .copied()
+                    .filter(|&peer| peer != node_id)
+                    .collect();
+                RaftNode::with_rng(node_id, peers, node_rng(seed, node_id))
+            })
+            .collect();
+        let mut simulator = Simulator::new(seed, nodes);
+
+        for _ in 0..600 {
+            simulator.run(1);
+            let leaders: Vec<_> = simulator
+                .nodes()
+                .iter()
+                .filter(|(_, node)| node.state() == crate::raft::state::RaftState::Leader)
+                .map(|(&node_id, _)| node_id)
+                .collect();
+            if let [leader_id] = leaders.as_slice() {
+                return (simulator, *leader_id);
+            }
+        }
+
+        panic!("cluster {node_ids:?} did not elect exactly one leader");
+    }
+
+    fn assert_committed_cas_is_visible_on_every_node(node_ids: &[u64]) {
+        let (mut simulator, leader_id) = elected_raft_cluster(41, node_ids);
+        let key = b"cas-key".to_vec();
+
+        let set = ClientRequest::new(
+            1,
+            1,
+            Command::Set {
+                key: key.clone(),
+                value: b"before".to_vec(),
+            },
+        );
+        simulator.step_node(
+            leader_id,
+            Input::ClientCommand(set.encode().expect("encode set")),
+        );
+        simulator.run(200);
+
+        // Two distinct clients race. Both commands carry version 1, and Raft
+        // commits them in log order, so only the first can transition the key to
+        // version 2.
+        for (client_id, value) in [(2, b"first".to_vec()), (3, b"second".to_vec())] {
+            let cas = ClientRequest::new(
+                client_id,
+                1,
+                Command::Cas {
+                    key: key.clone(),
+                    expected_version: Some(1),
+                    value: Some(value),
+                },
+            );
+            simulator.step_node(
+                leader_id,
+                Input::ClientCommand(cas.encode().expect("encode CAS")),
+            );
+        }
+        simulator.run(300);
+
+        let snapshots: Vec<_> = simulator
+            .state_machines()
+            .values()
+            .map(|state_machine| {
+                assert_eq!(state_machine.get(&key), Some(b"first".as_slice()));
+                assert_eq!(state_machine.version(&key), Some(2));
+                state_machine.snapshot().expect("snapshot")
+            })
+            .collect();
+        assert!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "invariant hook is compiled out without debug assertions"
+    )]
+    #[should_panic(expected = "vote once violated: node 1 voted for 2 and then 3 in term 1")]
+    fn invariant_hook_catches_an_injected_double_vote() {
+        let ids = [1_u64, 2, 3];
+        let nodes = ids
+            .iter()
+            .map(|&id| {
+                let peers = ids.iter().copied().filter(|&p| p != id).collect();
+                RaftNode::with_rng(id, peers, node_rng(7, id))
+            })
+            .collect();
+        let mut simulator = Simulator::new(7, nodes);
+        simulator.step_node(
+            1,
+            Input::Message {
+                from: 2,
+                rpc: RaftRpc::RequestVote(RequestVoteRequest {
+                    term: 1,
+                    candidate_id: 2,
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            },
+        );
+
+        // Corrupt node 1 behind the protocol's back; the next step must catch it.
+        simulator.nodes.get_mut(&1).expect("node 1").voted_for = Some(3);
+        simulator.run(1);
+    }
+
+    #[test]
+    fn committed_write_and_cas_are_visible_on_every_node_in_a_two_node_cluster() {
+        assert_committed_cas_is_visible_on_every_node(&[1, 2]);
+    }
+
+    #[test]
+    fn committed_write_and_cas_are_visible_on_every_node_in_a_three_node_cluster() {
+        assert_committed_cas_is_visible_on_every_node(&[1, 2, 3]);
     }
 }

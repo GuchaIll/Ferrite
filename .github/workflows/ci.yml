@@ -62,6 +62,10 @@ jobs:
         run: bash .github/scripts/check-sim-invariants.sh
       - name: Check Raft core stays synchronous
         run: bash .github/scripts/check-raft-invariants.sh
+      - name: Check KV state machine determinism
+        run: bash .github/scripts/check-kv-invariants.sh
+      - name: Check every source file is in the module tree
+        run: bash .github/scripts/check-module-tree.sh
       - run: cargo test --all-targets --verbose
       - name: Deterministic replay stress test
         run: cargo test --lib sim::tests::same_seed_is_deterministic_for_one_thousand_seeds -- --ignored
@@ -69,6 +73,24 @@ jobs:
         run: |
           cargo clean
           cargo test --lib sim::tests::canonical_trace_matches_golden_fixture
+
+  acceptance:
+    name: 1000-seed Acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - name: Election and replicate acceptance (issues #9, #10)
+        # Keep the simulator's invariant hook (gated on debug_assertions) on at release speed.
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+        run: >
+          cargo test --release --lib -- --ignored
+          elects_exactly_one_leader_within_600_ticks_for_1000_seeds
+          replicate_100_writes_identical_logs_for_1000_seeds
 
   build:
     name: Build

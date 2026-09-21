@@ -19,6 +19,6 @@ fail_if_found() {
     fi
 }
 
-fail_if_found "asynchronous consensus code" 'async fn|\.await'
+fail_if_found "asynchronous consensus code" '\basync\b|\.await'
 fail_if_found "Tokio in the consensus core" 'tokio'
 fail_if_found "wall-clock reads in the consensus core" 'Instant::now'

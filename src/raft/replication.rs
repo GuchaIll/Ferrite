@@ -571,6 +571,50 @@ mod tests {
     }
 
     #[test]
+    fn delayed_success_reply_to_shorter_request_acks_only_what_it_covered() {
+        let mut leader = leader_with_log(&[]);
+        leader.current_term = 1;
+
+        // The request to peer 2 covers index 1 only; hold it back in flight.
+        let delayed = append_and_replicate(&mut leader, b"a".to_vec())
+            .into_iter()
+            .find_map(|a| match a {
+                ElectionAction::Send {
+                    to: 2,
+                    rpc: RaftRpc::AppendEntries(req),
+                } => Some(req),
+                _ => None,
+            })
+            .expect("leader must send AppendEntries to peer 2");
+        assert_eq!(delayed.prev_log_index + delayed.entries.len() as u64, 1);
+
+        // The leader grows its log before the older reply arrives.
+        append_and_replicate(&mut leader, b"b".to_vec());
+        assert_eq!(leader.log.last_index(), 2);
+
+        // Real follower path produces the reply to the older, shorter request.
+        let mut peer = follower();
+        let resp = handle_append_entries_request(&mut peer, 1, delayed)
+            .into_iter()
+            .find_map(|a| match a {
+                ElectionAction::Send {
+                    rpc: RaftRpc::AppendEntriesResponse(resp),
+                    ..
+                } => Some(resp),
+                _ => None,
+            })
+            .expect("follower must reply");
+        assert!(resp.success);
+
+        handle_append_entries_response(&mut leader, 2, resp);
+
+        // Only index 1 was acknowledged; index 2 must not count peer 2 as a replica.
+        assert_eq!(leader.match_index[&2], 1);
+        assert_eq!(leader.next_index[&2], 2);
+        assert_eq!(leader.commit_index, 1);
+    }
+
+    #[test]
     fn quorum_of_current_term_acks_advances_commit_index() {
         // 3-node cluster: leader + one follower at index 3 is a majority.
         let mut node = leader_with_log(&[(1, 1, b"a"), (2, 1, b"b"), (3, 1, b"c")]);
