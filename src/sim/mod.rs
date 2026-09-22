@@ -193,6 +193,9 @@ impl<N: SimNode> Simulator<N> {
                     // future extension. Effects ordering is still enforced by
                     // draining Persist before subsequent Sends in this list.
                 }
+                Output::PersistLog { .. } => {
+                    // Step 4 of issue 03 routes this into per-node sim storage.
+                }
                 Output::Apply(entry) => {
                     let Some(state_machine) = self.state_machines.get_mut(&from) else {
                         continue;

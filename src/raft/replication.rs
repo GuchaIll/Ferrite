@@ -51,9 +51,19 @@ pub(crate) fn handle_append_entries_request(
 
     // append_from_leader validates contiguity first, then truncates only at the
     // first conflicting index (exact-match prefix is retained / no-op).
-    if node.log.append_from_leader(&req.entries).is_err() {
-        actions.push(append_entries_reply(from, node.current_term, false, 0));
-        return actions;
+    let outcome = match node.log.append_from_leader(&req.entries) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            actions.push(append_entries_reply(from, node.current_term, false, 0));
+            return actions;
+        }
+    };
+    // Durable before the success reply below; nothing to write if all matched.
+    if !outcome.is_empty() {
+        actions.push(ElectionAction::PersistLog {
+            truncate_from: outcome.truncated_from,
+            entries: outcome.appended,
+        });
     }
 
     // Paper step 5: advance commitIndex from leaderCommit (apply is separate).
@@ -147,12 +157,18 @@ pub(crate) fn append_and_replicate(node: &mut RaftNode, command: Vec<u8>) -> Vec
         command,
     };
 
-    if node.log.append(entry).is_err() {
+    if node.log.append(entry.clone()).is_err() {
         // Unreachable for a contiguous leader log; refuse rather than panic.
         return Vec::new();
     }
 
-    broadcast_append_entries(node)
+    // The leader's own copy is durable before any follower can ack it.
+    let mut actions = vec![ElectionAction::PersistLog {
+        truncate_from: None,
+        entries: vec![entry],
+    }];
+    actions.extend(broadcast_append_entries(node));
+    actions
 }
 
 /// Builds one AppendEntries/InstallSnapshot Send for every peer from the leader's `next_index`.
@@ -332,6 +348,26 @@ mod tests {
         RaftNode::new(2, vec![1, 3])
     }
 
+    /// Returns the single `PersistLog` in `actions`, asserting it precedes every `Send`.
+    fn persist_log_before_sends(actions: &[ElectionAction]) -> (Option<u64>, Vec<LogEntry>) {
+        let position = |pred: fn(&ElectionAction) -> bool| actions.iter().position(pred);
+        let persist = position(|a| matches!(a, ElectionAction::PersistLog { .. }))
+            .unwrap_or_else(|| panic!("expected PersistLog, got {actions:?}"));
+        let first_send = position(|a| matches!(a, ElectionAction::Send { .. }));
+        assert!(
+            first_send.is_none_or(|send| persist < send),
+            "PersistLog must precede every Send: {actions:?}"
+        );
+        match &actions[persist] {
+            ElectionAction::PersistLog {
+                truncate_from,
+                entries,
+            } => (*truncate_from, entries.clone()),
+            _ => unreachable!(),
+        }
+    }
+
+
     fn ae(
         term: u64,
         prev_idx: u64,
@@ -439,6 +475,11 @@ mod tests {
                 ..
             })
         ));
+        // The conflict at index 3 is durable as a truncate plus the new suffix.
+        assert_eq!(
+            persist_log_before_sends(&actions),
+            (Some(3), node.log.entries_from(3))
+        );
         assert_eq!(
             node.log.entries_from(1),
             vec![
@@ -484,6 +525,13 @@ mod tests {
             })
         ));
         assert_eq!(node.log, before);
+        // Nothing changed, so nothing is written (no fsync per retry/heartbeat).
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ElectionAction::PersistLog { .. })),
+            "matching batch must not persist: {actions:?}"
+        );
     }
 
     #[test]
@@ -552,6 +600,10 @@ mod tests {
         let actions = append_and_replicate(&mut node, b"cmd".to_vec());
         assert_eq!(node.log.last_index(), 1);
         assert_eq!(node.log.entry(1).unwrap().command, b"cmd");
+        assert_eq!(
+            persist_log_before_sends(&actions),
+            (None, vec![LogEntry::new(1, 1, b"cmd".to_vec())])
+        );
         let sends: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {

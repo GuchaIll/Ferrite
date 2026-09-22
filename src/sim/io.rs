@@ -24,6 +24,14 @@ pub enum Input {
 ///
 /// Ordering contract:
 /// - `Persist` (hard state) before a dependent `Send`
+/// - `PersistLog` before a dependent `Send`: a follower's success reply, and
+///   any AppendEntries carrying a leader's newly appended entry
+/// - Durability boundary is the drained batch: every write output in a batch
+///   is durable before the first `Send`, `Apply`, or `ApplySnapshot` after it
+/// - One batch in flight per node: the driver finishes draining (and making
+///   durable) a node's batch before stepping that node again. The leader
+///   counts its own `last_index` toward a majority, which is safe only
+///   because of this rule
 /// - `PersistSnapshot` before the log prefix it replaces is discarded
 /// - `PersistSnapshot` before a dependent InstallSnapshot reply `Send`
 /// - `ApplySnapshot` installs state-machine bytes (including the dedup table)
@@ -41,6 +49,12 @@ pub enum Output {
     Apply(LogEntry),
     /// Make Raft election metadata durable.
     Persist(HardState),
+    /// Make a log mutation durable: drop entries at or above `truncate_from`
+    /// (if set), then append `entries`.
+    PersistLog {
+        truncate_from: Option<u64>,
+        entries: Vec<LogEntry>,
+    },
     /// Ask the driver to snapshot the state machine at this log boundary.
     RequestSnapshot {
         last_included_index: u64,

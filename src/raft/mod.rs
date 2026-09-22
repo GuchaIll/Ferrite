@@ -176,6 +176,29 @@ impl RaftNode {
         )
     }
 
+    /// Rebuilds a node after a restart from its durable state alone.
+    ///
+    /// Only `currentTerm`, `votedFor`, the log, and the snapshot come back.
+    /// Role, leader hint, and leader bookkeeping reset; `commit_index` and
+    /// `last_applied` restart at the snapshot boundary. `rng` should be a
+    /// fresh per-node stream: a reboot does not resume the old jitter sequence.
+    pub fn recover(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        rng: ChaCha8Rng,
+        recovered: storage::Recovered,
+    ) -> RaftNode {
+        let mut node = Self::with_rng(id, peers, rng);
+        let applied = recovered.log.last_included_index();
+        node.current_term = recovered.hard_state.current_term;
+        node.voted_for = recovered.hard_state.voted_for;
+        node.log = recovered.log;
+        node.snapshot = recovered.snapshot;
+        node.commit_index = applied;
+        node.last_applied = applied;
+        node
+    }
+
     fn new_with_timeouts(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -327,6 +350,40 @@ mod tests {
     #[test]
     fn id_returns_the_configured_node_id() {
         assert_eq!(node(1).id(), 1);
+    }
+
+    #[test]
+    fn recover_restores_durable_state_and_resets_volatile_state() {
+        let mut log = RaftLog::new();
+        log.install_snapshot(2, 1);
+        log.append(LogEntry::new(3, 2, b"c".to_vec())).unwrap();
+        let snapshot = Snapshot::new(SnapshotMeta::new(2, 1), b"sm".to_vec());
+
+        let node = RaftNode::recover(
+            1,
+            vec![2, 3],
+            ChaCha8Rng::seed_from_u64(1),
+            storage::Recovered {
+                hard_state: HardState {
+                    current_term: 4,
+                    voted_for: Some(3),
+                },
+                log: log.clone(),
+                snapshot: Some(snapshot.clone()),
+            },
+        );
+
+        assert_eq!(node.current_term, 4);
+        assert_eq!(node.voted_for, Some(3));
+        assert_eq!(node.log, log);
+        assert_eq!(node.snapshot, Some(snapshot));
+        assert_eq!(node.state, RaftState::Follower);
+        assert_eq!(node.leader_id, None);
+        // Everything up to the snapshot is applied; nothing past it is known committed.
+        assert_eq!(node.commit_index, 2);
+        assert_eq!(node.last_applied, 2);
+        assert!(node.next_index.is_empty() && node.match_index.is_empty());
+        assert!(node.pending_snapshot.is_none());
     }
 
     #[test]

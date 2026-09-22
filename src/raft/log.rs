@@ -2,8 +2,10 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// One replicated state-machine operation.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// One-based, contiguous position in the Raft log.
     pub index: u64,
@@ -43,6 +45,26 @@ impl fmt::Display for LogIndexError {
 }
 
 impl std::error::Error for LogIndexError {}
+
+/// The mutation [`RaftLog::append_from_leader`] applied to the local log.
+///
+/// Empty when every incoming entry already matched. Otherwise the driver must
+/// make `truncated_from` (if any) and then `appended` durable before the
+/// success reply that depends on them.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct AppendOutcome {
+    /// First index removed from the local suffix, if a conflict removed any.
+    pub truncated_from: Option<u64>,
+    /// Entries appended, in index order.
+    pub appended: Vec<LogEntry>,
+}
+
+impl AppendOutcome {
+    /// Returns whether the log was left unchanged.
+    pub fn is_empty(&self) -> bool {
+        self.truncated_from.is_none() && self.appended.is_empty()
+    }
+}
 
 /// A log lookup that cannot be satisfied without inventing a wrong answer.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -249,7 +271,12 @@ impl RaftLog {
     /// Entries with equal index and term are retained. At the first term conflict,
     /// the local suffix is replaced by the leader's suffix. An invalid incoming batch
     /// is rejected before changing the local log.
-    pub fn append_from_leader(&mut self, incoming: &[LogEntry]) -> Result<(), LogIndexError> {
+    ///
+    /// Returns the exact mutation performed so the driver can make it durable.
+    pub fn append_from_leader(
+        &mut self,
+        incoming: &[LogEntry],
+    ) -> Result<AppendOutcome, LogIndexError> {
         Self::validate_contiguous(incoming)?;
 
         let first_to_append = incoming
@@ -259,14 +286,22 @@ impl RaftLog {
                 Err(_) => true,
             });
 
-        if let Some(position) = first_to_append {
-            self.truncate_from(incoming[position].index)?;
+        let Some(position) = first_to_append else {
+            return Ok(AppendOutcome::default());
+        };
 
-            for entry in &incoming[position..] {
-                self.append(entry.clone())?;
-            }
+        let first_index = incoming[position].index;
+        let truncated_from = (first_index <= self.last_index()).then_some(first_index);
+        self.truncate_from(first_index)?;
+
+        let appended = incoming[position..].to_vec();
+        for entry in &appended {
+            self.append(entry.clone())?;
         }
-        Ok(())
+        Ok(AppendOutcome {
+            truncated_from,
+            appended,
+        })
     }
 
     /// Removes every entry whose index is at least `index`.
@@ -317,7 +352,7 @@ impl RaftLog {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogEntry, LogIndexError, LogLookupError, RaftLog};
+    use super::{AppendOutcome, LogEntry, LogIndexError, LogLookupError, RaftLog};
 
     fn entry(index: u64, term: u64, command: &[u8]) -> LogEntry {
         LogEntry::new(index, term, command.to_vec())
@@ -420,9 +455,18 @@ mod tests {
         let mut log = RaftLog::new();
         log.append(entry(1, 1, b"one")).unwrap();
 
-        log.append_from_leader(&[entry(2, 1, b"two"), entry(3, 2, b"three")])
+        let outcome = log
+            .append_from_leader(&[entry(2, 1, b"two"), entry(3, 2, b"three")])
             .unwrap();
 
+        // Pure append: nothing local was removed.
+        assert_eq!(
+            outcome,
+            AppendOutcome {
+                truncated_from: None,
+                appended: vec![entry(2, 1, b"two"), entry(3, 2, b"three")],
+            }
+        );
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.last_term(), 2);
         assert_eq!(
@@ -446,12 +490,22 @@ mod tests {
             log.append(item).unwrap();
         }
 
-        log.append_from_leader(&[
-            entry(2, 1, b"two"),
-            entry(3, 3, b"new"),
-            entry(4, 3, b"four"),
-        ])
-        .unwrap();
+        let outcome = log
+            .append_from_leader(&[
+                entry(2, 1, b"two"),
+                entry(3, 3, b"new"),
+                entry(4, 3, b"four"),
+            ])
+            .unwrap();
+
+        // The matching entry 2 is skipped; the conflict at 3 truncates.
+        assert_eq!(
+            outcome,
+            AppendOutcome {
+                truncated_from: Some(3),
+                appended: vec![entry(3, 3, b"new"), entry(4, 3, b"four")],
+            }
+        );
 
         assert_eq!(
             log.entries_from(1),

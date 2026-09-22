@@ -39,6 +39,13 @@ fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
         .into_iter()
         .filter_map(|action| match action {
             ElectionAction::Persist(hard_state) => Some(Output::Persist(hard_state)),
+            ElectionAction::PersistLog {
+                truncate_from,
+                entries,
+            } => Some(Output::PersistLog {
+                truncate_from,
+                entries,
+            }),
             ElectionAction::Send { to, rpc } => Some(Output::Send { to, rpc }),
             // Role / redirect effects are already reflected in Raft core state.
             ElectionAction::PromoteLeader

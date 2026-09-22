@@ -20,6 +20,12 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElectionAction {
     Persist(HardState),
+    /// Make a log mutation durable: drop entries at or above `truncate_from`
+    /// (if set), then append `entries`. Precedes any `Send` that depends on it.
+    PersistLog {
+        truncate_from: Option<u64>,
+        entries: Vec<LogEntry>,
+    },
     Send {
         to: NodeId,
         rpc: RaftRpc,
@@ -231,9 +237,8 @@ fn become_leader(node: &mut RaftNode) -> Vec<ElectionAction> {
     }
 
     // `next_index()` is `last_index() + 1`, so this append is contiguous by construction.
-    let appended = node
-        .log
-        .append(LogEntry::new(noop_index, node.current_term, Vec::new()));
+    let noop = LogEntry::new(noop_index, node.current_term, Vec::new());
+    let appended = node.log.append(noop.clone());
     debug_assert!(
         appended.is_ok(),
         "no-op at leader's next_index must be contiguous: {appended:?}"
@@ -241,6 +246,13 @@ fn become_leader(node: &mut RaftNode) -> Vec<ElectionAction> {
 
     node.heartbeat_ticks = node.heartbeat_interval_ticks;
     let mut actions = vec![ElectionAction::PromoteLeader];
+    // The no-op is durable before any AppendEntries carrying it leaves.
+    if appended.is_ok() {
+        actions.push(ElectionAction::PersistLog {
+            truncate_from: None,
+            entries: vec![noop],
+        });
+    }
     actions.extend(replication::broadcast_append_entries(node));
     actions
 }
@@ -413,6 +425,21 @@ mod tests {
             assert_eq!(req.prev_log_term, 0);
             assert_eq!(req.entries, vec![LogEntry::new(1, 1, vec![])]);
         }
+
+        // The no-op is persisted before the first AppendEntries carrying it.
+        let persist = actions.iter().position(|a| {
+            *a == ElectionAction::PersistLog {
+                truncate_from: None,
+                entries: vec![LogEntry::new(1, 1, vec![])],
+            }
+        });
+        let first_send = actions
+            .iter()
+            .position(|a| matches!(a, ElectionAction::Send { .. }));
+        assert!(
+            matches!((persist, first_send), (Some(p), Some(s)) if p < s),
+            "no-op PersistLog must precede the first Send: {actions:?}"
+        );
     }
 
     #[test]
