@@ -15,15 +15,17 @@ use crate::{
     },
 };
 
+use serde::{Deserialize, Serialize};
+
 /// Metadata describing the last log entry covered by a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMeta {
     pub last_included_index: u64,
     pub last_included_term: u64,
 }
 
 /// Full snapshot handed across the driver boundary (persist / apply / install).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub meta: SnapshotMeta,
     pub data: Vec<u8>,
@@ -95,10 +97,7 @@ pub(crate) fn request_snapshot_action(node: &RaftNode) -> ElectionAction {
 ///
 /// Log trim happens only in [`on_snapshot_persisted`] after the driver drains
 /// `PersistSnapshot` (snapshot-before-trim durability order).
-pub(crate) fn on_snapshot_taken(
-    node: &mut RaftNode,
-    snapshot: Snapshot,
-) -> Vec<ElectionAction> {
+pub(crate) fn on_snapshot_taken(node: &mut RaftNode, snapshot: Snapshot) -> Vec<ElectionAction> {
     let last_included_index = snapshot.meta.last_included_index;
 
     debug_assert!(
@@ -239,6 +238,16 @@ pub(crate) fn handle_install_snapshot_request(
 
     let snapshot = Snapshot::new(pending.meta, pending.data);
 
+    // A local entry at the boundary with a different term means the whole
+    // local suffix is discarded. Storage must record that discard, or replay
+    // would resurrect the stale entries. A log shorter than the boundary holds
+    // nothing replay would keep, so it needs no record.
+    let discards_local_log = node.log.last_index() >= snapshot.meta.last_included_index
+        && !node.log.contains(
+            snapshot.meta.last_included_index,
+            snapshot.meta.last_included_term,
+        );
+
     // Log install: keep suffix on matching (index, term), else discard.
     node.log.install_snapshot(
         snapshot.meta.last_included_index,
@@ -251,7 +260,16 @@ pub(crate) fn handle_install_snapshot_request(
     node.snapshot = Some(snapshot.clone());
 
     // Durability before reply: persist snapshot, apply to state machine, then ack.
+    // The truncate follows the snapshot so a crash between them recovers the
+    // snapshot, whose boundary check discards the stale entries anyway.
+    let last_included_index = snapshot.meta.last_included_index;
     actions.push(ElectionAction::PersistSnapshot(snapshot.clone()));
+    if discards_local_log {
+        actions.push(ElectionAction::PersistLog {
+            truncate_from: Some(last_included_index),
+            entries: Vec::new(),
+        });
+    }
     actions.push(ElectionAction::ApplySnapshot(snapshot));
     actions.push(install_snapshot_reply(from, node.current_term));
     actions
@@ -369,9 +387,7 @@ mod tests {
     fn install_snapshot_done_applies_and_persists() {
         let mut node = RaftNode::new(2, vec![1, 3]);
         node.current_term = 1;
-        node.log
-            .append(LogEntry::new(1, 1, b"a".to_vec()))
-            .unwrap();
+        node.log.append(LogEntry::new(1, 1, b"a".to_vec())).unwrap();
         let req = InstallSnapshotRequest {
             term: 1,
             leader_id: 1,
@@ -392,5 +408,47 @@ mod tests {
         ));
         assert_eq!(node.log.last_included_index(), 2);
         assert_eq!(node.last_applied, 2);
+    }
+
+    #[test]
+    fn install_over_conflicting_log_persists_truncate_after_snapshot() {
+        let mut node = RaftNode::new(2, vec![1, 3]);
+        node.current_term = 3;
+        for entry in [
+            LogEntry::new(1, 1, b"a".to_vec()),
+            LogEntry::new(2, 2, b"stale".to_vec()),
+            LogEntry::new(3, 2, b"stale".to_vec()),
+        ] {
+            node.log.append(entry).unwrap();
+        }
+        let req = InstallSnapshotRequest {
+            term: 3,
+            leader_id: 1,
+            last_included_index: 2,
+            last_included_term: 3,
+            offset: 0,
+            data: b"full".to_vec(),
+            done: true,
+        };
+
+        let actions = handle_install_snapshot_request(&mut node, 1, req);
+
+        // Snapshot first, then the durable discard, then apply and ack.
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [
+                    ElectionAction::PersistSnapshot(_),
+                    ElectionAction::PersistLog {
+                        truncate_from: Some(2),
+                        entries,
+                    },
+                    ElectionAction::ApplySnapshot(_),
+                    ElectionAction::Send { .. },
+                ] if entries.is_empty()
+            ),
+            "got {actions:?}"
+        );
+        assert_eq!(node.log.last_index(), 2);
     }
 }
