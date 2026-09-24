@@ -143,12 +143,13 @@ impl Default for RaftConfig {
 
 /// Persistence backend selection.
 ///
-/// `Disk` is the durable path (sled or a segment file behind `Storage` — **not** RocksDB).
+/// `Disk` is the durable segment-file backend behind [`crate::raft::storage::DiskStorage`].
+/// `Memory` is for the simulator and unit tests only.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StorageBackend {
     #[default]
     Memory,
-    /// On-disk store rooted at `data_dir` (implementation lands with durable storage).
+    /// On-disk segment-file store rooted at `data_dir`.
     Disk { data_dir: std::path::PathBuf },
 }
 
@@ -638,8 +639,6 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
     }
 
     // ── Storage ───────────────────────────────────────────────────────────
-    // "disk" = durable backend (sled / segment file). "rocksdb" is rejected by name so
-    // the deprecated MVP label cannot re-enter configs.
     let storage = match raw.storage.backend.as_deref() {
         None | Some("memory") => StorageConfig {
             backend: StorageBackend::Memory,
@@ -655,13 +654,6 @@ fn validate(raw: RawConfig) -> Result<Config, ConfigError> {
                 StorageConfig::default()
             }
         },
-        Some("rocksdb") => {
-            errors.push(
-                "storage.backend: \"rocksdb\" is not supported; use \"disk\" (sled/segment) or \"memory\""
-                    .into(),
-            );
-            StorageConfig::default()
-        }
         Some(other) => {
             errors.push(format!(
                 "storage.backend: unknown value {other:?}; expected \"memory\" or \"disk\""
@@ -1080,7 +1072,7 @@ addr = "127.0.0.1:8003"
         assert_eq!(cfg.raft.election_timeout_min.as_millis(), 200);
     }
 
-    // ── Gap coverage: storage disk / rocksdb ──────────────────────────────
+    // ── Gap coverage: storage disk ────────────────────────────────────────
 
     #[test]
     fn storage_disk_requires_data_dir() {
@@ -1104,16 +1096,6 @@ addr = "127.0.0.1:8003"
             }
             other => panic!("expected Disk, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn storage_rocksdb_name_rejected() {
-        let mut raw = three_node_raw();
-        raw.storage.backend = Some("rocksdb".into());
-        raw.storage.data_dir = Some("./data".into());
-        let err = validate(raw).unwrap_err().to_string();
-        assert!(err.contains("rocksdb"), "{err}");
-        assert!(err.contains("disk"), "{err}");
     }
 
     #[test]

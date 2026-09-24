@@ -28,6 +28,7 @@ pub mod trace;
 use crate::{
     config::NodeId,
     kv::KvStateMachine,
+    raft::storage::{LogOp, MemoryStorage, Storage, WriteBatch},
     raft::{RaftNode, invariant::InvariantChecker},
 };
 pub use io::{Input, Output};
@@ -84,8 +85,8 @@ pub struct Simulator<N: SimNode> {
     /// Application state owned by the simulator boundary, one per Raft node.
     state_machines: BTreeMap<NodeId, KvStateMachine>,
     network: Network,
-    /// Durable hard-state last observed per node (sim-side bookkeeping).
-    persisted: BTreeMap<NodeId, crate::raft::HardState>,
+    /// Per-node durable storage (MemoryStorage for in-sim durability/crash-restart).
+    storage: BTreeMap<NodeId, MemoryStorage>,
     trace: Trace,
     /// Safety history checked after every step and delivery in debug builds.
     invariants: InvariantChecker,
@@ -114,6 +115,11 @@ impl<N: SimNode> Simulator<N> {
             .copied()
             .map(|node_id| (node_id, KvStateMachine::new()))
             .collect();
+        let storage = registered
+            .keys()
+            .copied()
+            .map(|id| (id, MemoryStorage::default()))
+            .collect();
         let mut trace = Trace::new();
         trace.record(TraceEvent::new(
             0,
@@ -131,7 +137,7 @@ impl<N: SimNode> Simulator<N> {
             nodes: registered,
             state_machines,
             network: Network::new(),
-            persisted: BTreeMap::new(),
+            storage,
             trace,
             invariants: InvariantChecker::new(),
         }
@@ -176,92 +182,164 @@ impl<N: SimNode> Simulator<N> {
         &self.trace
     }
 
-    /// Drains ordered outputs from `from`, enqueuing sends onto the network.
+    /// Drains ordered outputs from `from`, applying group-commit.
+    ///
+    /// `Persist`, `PersistLog`, and `PersistSnapshot` accumulate into a single
+    /// `WriteBatch`. Before any non-persist output (Send, Apply, etc.) and at the
+    /// end of the list, the batch is committed in one call — one sync per batch.
+    ///
+    /// On commit failure the remaining outputs are **not** dispatched: a failed
+    /// durable write must not be followed by a success RPC or state-machine apply
+    /// (Raft: durable before reply). The node is crashed so volatile state cannot
+    /// diverge further from storage.
     fn drain_outputs(&mut self, tick: u64, from: NodeId, outputs: Vec<Output>) {
+        let mut batch = WriteBatch::default();
+
         for output in outputs {
             match output {
-                #[cfg(test)]
-                Output::Echo { payload } => self.trace.record(TraceEvent::new(
-                    tick,
-                    TraceEventKind::Echo,
-                    Some(from),
-                    Some(TracePayload::Bytes(payload)),
-                )),
-                Output::Persist(hard_state) => {
-                    self.persisted.insert(from, hard_state);
-                    // Persistence is durable bookkeeping; no trace kind yet beyond
-                    // future extension. Effects ordering is still enforced by
-                    // draining Persist before subsequent Sends in this list.
+                Output::Persist(hs) => {
+                    batch.hard_state = Some(hs);
                 }
-                Output::PersistLog { .. } => {
-                    // Step 4 of issue 03 routes this into per-node sim storage.
-                }
-                Output::Apply(entry) => {
-                    let Some(state_machine) = self.state_machines.get_mut(&from) else {
-                        continue;
-                    };
-                    if let Err(error) = state_machine.apply(&entry) {
-                        tracing::error!(node_id = from, %error, "could not apply committed KV entry");
-                    }
-                }
-                Output::RequestSnapshot {
-                    last_included_index,
-                    last_included_term,
+                Output::PersistLog {
+                    truncate_from,
+                    entries,
                 } => {
-                    // Driver-side snapshot: serialize SM, then feed SnapshotTaken back.
-                    // Issue 03 will make PersistSnapshot durable; for now apply path is local.
-                    let Some(state_machine) = self.state_machines.get(&from) else {
-                        continue;
-                    };
-                    match state_machine.snapshot() {
-                        Ok(data) => {
-                            let snapshot = crate::raft::Snapshot::new(
-                                crate::raft::SnapshotMeta::new(
-                                    last_included_index,
-                                    last_included_term,
-                                ),
-                                data,
-                            );
-                            // Re-enter the node with snapshot bytes in the same drain window
-                            // so compaction can proceed without waiting a tick.
-                            if let Some(node) = self.nodes.get_mut(&from) {
-                                let follow_up = node.step(Input::SnapshotTaken(snapshot));
-                                // Nested drain: PersistSnapshot / etc. before later outputs.
-                                self.drain_outputs(tick, from, follow_up);
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(node_id = from, %error, "could not snapshot KV state");
-                        }
+                    if let Some(t) = truncate_from {
+                        batch.log.push(LogOp::TruncateFrom(t));
+                    }
+                    for e in entries {
+                        batch.log.push(LogOp::Append(e));
                     }
                 }
-                Output::PersistSnapshot(snapshot) => {
-                    // Issue 03: atomic snapshot persist. Stub acknowledges durability
-                    // immediately so the node can trim the replaced log prefix.
-                    let meta = snapshot.meta;
-                    if let Some(node) = self.nodes.get_mut(&from) {
-                        let follow_up = node.step(Input::SnapshotPersisted(meta));
-                        self.drain_outputs(tick, from, follow_up);
-                    }
+                Output::PersistSnapshot(snap) => {
+                    batch.snapshot = Some(snap);
                 }
-                Output::ApplySnapshot(snapshot) => {
-                    let Some(state_machine) = self.state_machines.get_mut(&from) else {
-                        continue;
-                    };
-                    if let Err(error) = state_machine.restore(&snapshot.data) {
-                        tracing::error!(node_id = from, %error, "could not restore KV snapshot");
+                other => {
+                    // Non-persist output: commit the accumulated batch first.
+                    if !self.flush_batch(tick, from, &mut batch) {
+                        return;
                     }
-                }
-                Output::Send { to, rpc } => {
-                    self.trace.record(TraceEvent::new(
-                        tick,
-                        TraceEventKind::Send,
-                        Some(from),
-                        None,
-                    ));
-                    self.network.enqueue(from, to, rpc);
+                    self.dispatch_output(tick, from, other);
                 }
             }
+        }
+
+        // Flush any trailing persist outputs after the last non-persist one.
+        let _ = self.flush_batch(tick, from, &mut batch);
+    }
+
+    /// Commits `batch` to the node's storage.
+    ///
+    /// Returns `false` if durability failed: the batch is discarded, the node is
+    /// crashed, and the caller must not dispatch subsequent outputs.
+    ///
+    /// On success, a snapshot in the batch is acknowledged with
+    /// `SnapshotPersisted` so the log can be trimmed.
+    fn flush_batch(&mut self, tick: u64, from: NodeId, batch: &mut WriteBatch) -> bool {
+        if batch.is_empty() {
+            return true;
+        }
+        // Capture snapshot meta before consuming the batch.
+        let snap_meta = batch.snapshot.as_ref().map(|s| s.meta.clone());
+
+        let commit_ok = match self.storage.get_mut(&from) {
+            Some(s) => match s.commit(batch) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(node_id = from, error = %e, "storage commit failed");
+                    false
+                }
+            },
+            // No storage entry: treat as failure rather than silently skipping.
+            None => {
+                tracing::error!(node_id = from, "storage missing for node during flush");
+                false
+            }
+        };
+        *batch = WriteBatch::default();
+
+        if !commit_ok {
+            // Fail closed: drop volatile state; durable store is unchanged.
+            self.crash_node(from);
+            return false;
+        }
+
+        // Snapshot was durable; tell the node so it can trim the log.
+        // on_snapshot_persisted returns [] in practice; drain it for correctness.
+        if let Some(meta) = snap_meta {
+            let follow_up = self
+                .nodes
+                .get_mut(&from)
+                .map(|n| n.step(Input::SnapshotPersisted(meta)));
+            if let Some(outputs) = follow_up {
+                self.check_invariants();
+                self.drain_outputs(tick, from, outputs);
+            }
+        }
+        true
+    }
+
+    /// Routes a single non-persist output.
+    fn dispatch_output(&mut self, tick: u64, from: NodeId, output: Output) {
+        match output {
+            #[cfg(test)]
+            Output::Echo { payload } => self.trace.record(TraceEvent::new(
+                tick,
+                TraceEventKind::Echo,
+                Some(from),
+                Some(TracePayload::Bytes(payload)),
+            )),
+            Output::Apply(entry) => {
+                if let Some(sm) = self.state_machines.get_mut(&from)
+                    && let Err(error) = sm.apply(&entry)
+                {
+                    tracing::error!(node_id = from, %error, "could not apply committed KV entry");
+                }
+            }
+            Output::RequestSnapshot {
+                last_included_index,
+                last_included_term,
+            } => {
+                // Serialize the SM, feed SnapshotTaken back; the nested drain will
+                // batch the resulting PersistSnapshot before sending any messages.
+                let snap = self
+                    .state_machines
+                    .get(&from)
+                    .and_then(|sm| sm.snapshot().ok())
+                    .map(|data| {
+                        crate::raft::Snapshot::new(
+                            crate::raft::SnapshotMeta::new(last_included_index, last_included_term),
+                            data,
+                        )
+                    });
+                if let Some(snapshot) = snap {
+                    let follow_up = self
+                        .nodes
+                        .get_mut(&from)
+                        .map(|n| n.step(Input::SnapshotTaken(snapshot)));
+                    if let Some(outputs) = follow_up {
+                        self.drain_outputs(tick, from, outputs);
+                    }
+                }
+            }
+            Output::ApplySnapshot(snapshot) => {
+                if let Some(sm) = self.state_machines.get_mut(&from)
+                    && let Err(error) = sm.restore(&snapshot.data)
+                {
+                    tracing::error!(node_id = from, %error, "could not restore KV snapshot");
+                }
+            }
+            Output::Send { to, rpc } => {
+                self.trace.record(TraceEvent::new(
+                    tick,
+                    TraceEventKind::Send,
+                    Some(from),
+                    None,
+                ));
+                self.network.enqueue(from, to, rpc);
+            }
+            // Persist variants are accumulated before dispatch_output is called.
+            Output::Persist(_) | Output::PersistLog { .. } | Output::PersistSnapshot(_) => {}
         }
     }
 
@@ -337,9 +415,14 @@ impl<N: SimNode> Simulator<N> {
         &self.state_machines
     }
 
-    /// Returns last-persisted hard state per node (sim bookkeeping).
-    pub fn persisted(&self) -> &BTreeMap<NodeId, crate::raft::HardState> {
-        &self.persisted
+    /// Returns the last-drained (durable) hard state for every node.
+    ///
+    /// Builds from storage on each call; use sparingly in hot test paths.
+    pub fn persisted(&self) -> BTreeMap<NodeId, crate::raft::HardState> {
+        self.storage
+            .iter()
+            .filter_map(|(&id, s)| s.recover().ok().map(|r| (id, r.hard_state)))
+            .collect()
     }
 
     /// Drops all messages to/from `node_id` until [`Simulator::connect_node`] is called.
@@ -372,6 +455,74 @@ impl<N: SimNode> Simulator<N> {
             self.invariants
                 .observe(self.nodes.values().filter_map(SimNode::raft));
         }
+    }
+
+    /// Removes the node and its KV state machine; keeps its durable storage.
+    ///
+    /// Used for explicit crash injection and for fail-closed storage errors.
+    /// The node is isolated so in-flight messages to it are dropped.
+    pub fn crash_node(&mut self, id: NodeId) {
+        self.nodes.remove(&id);
+        self.state_machines.remove(&id);
+        self.network.isolate(id);
+    }
+}
+
+impl Simulator<RaftNode> {
+    /// Steps the node with `input`, discards all outputs without draining, then
+    /// crashes the node.
+    ///
+    /// Models a crash that happens before the driver drains anything: none of the
+    /// outputs reach storage, so those writes are permanently lost.
+    pub fn step_and_crash(&mut self, id: NodeId, input: Input) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            let _discarded = node.step(input);
+        }
+        self.crash_node(id);
+    }
+
+    /// Rebuilds a crashed node from its durable storage.
+    ///
+    /// Returns `false` when storage is missing or recovery fails; the node is
+    /// left down. Callers (and crash scenarios) must treat that as a hard fault.
+    pub fn restart_node(&mut self, id: NodeId) -> bool {
+        // Peers are all storage entries (original IDs) except this one.
+        let peers: Vec<NodeId> = self.storage.keys().copied().filter(|&p| p != id).collect();
+
+        let recovered = match self.storage.get(&id).map(|s| s.recover()) {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
+                tracing::error!(node_id = id, error = %e, "storage recovery failed on restart");
+                return false;
+            }
+            None => {
+                tracing::error!(node_id = id, "no storage entry for restart");
+                return false;
+            }
+        };
+
+        // Clone justified: snap data needed after recovered moves into RaftNode::recover.
+        let snap_data = recovered.snapshot.as_ref().map(|s| s.data.clone());
+        let node = RaftNode::recover(id, peers, node_rng(self.root_seed, id), recovered);
+
+        let mut sm = KvStateMachine::new();
+        if let Some(data) = snap_data
+            && let Err(e) = sm.restore(&data)
+        {
+            tracing::error!(node_id = id, error = %e, "KV restore failed on restart");
+            // Node comes back without SM state only if restore fails; still
+            // register so the cluster can catch up via InstallSnapshot.
+        }
+
+        self.nodes.insert(id, node);
+        self.state_machines.insert(id, sm);
+        self.network.connect(id);
+        true
+    }
+
+    /// Durable recovered view for `id` (last drained commits only).
+    pub fn recovered(&self, id: NodeId) -> Option<crate::raft::storage::Recovered> {
+        self.storage.get(&id)?.recover().ok()
     }
 }
 
@@ -783,5 +934,249 @@ mod tests {
     #[test]
     fn committed_write_and_cas_are_visible_on_every_node_in_a_three_node_cluster() {
         assert_committed_cas_is_visible_on_every_node(&[1, 2, 3]);
+    }
+
+    // ── crash / restart ────────────────────────────────────────────────────────
+
+    #[test]
+    fn crash_restart_preserves_drained_hard_state() {
+        use crate::raft::storage::Storage;
+        let (mut sim, leader_id) = elected_raft_cluster(1, &[1, 2, 3]);
+
+        // After election the leader has a non-zero term committed to storage.
+        let term_before = sim
+            .storage
+            .get(&leader_id)
+            .unwrap()
+            .recover()
+            .unwrap()
+            .hard_state
+            .current_term;
+        assert!(term_before > 0);
+
+        sim.crash_node(leader_id);
+        assert!(
+            sim.restart_node(leader_id),
+            "restart must succeed from drained hard state"
+        );
+
+        let term_after = sim
+            .storage
+            .get(&leader_id)
+            .unwrap()
+            .recover()
+            .unwrap()
+            .hard_state
+            .current_term;
+        assert_eq!(term_before, term_after);
+    }
+
+    #[test]
+    fn step_and_crash_does_not_commit_outputs_to_storage() {
+        use crate::raft::storage::Storage;
+        let (mut sim, leader_id) = elected_raft_cluster(5, &[1, 2, 3]);
+
+        let follower_id = sim
+            .nodes()
+            .keys()
+            .find(|&&id| id != leader_id)
+            .copied()
+            .unwrap();
+        let sync_before = sim.storage[&follower_id].sync_count();
+        let hs_before = sim
+            .storage
+            .get(&follower_id)
+            .unwrap()
+            .recover()
+            .unwrap()
+            .hard_state;
+
+        // step_and_crash: node steps but outputs are discarded before storage commit.
+        sim.step_and_crash(follower_id, Input::Tick);
+
+        let sync_after = sim.storage[&follower_id].sync_count();
+        let hs_after = sim
+            .storage
+            .get(&follower_id)
+            .unwrap()
+            .recover()
+            .unwrap()
+            .hard_state;
+
+        assert_eq!(
+            sync_before, sync_after,
+            "no commit must occur after step_and_crash"
+        );
+        assert_eq!(hs_before, hs_after, "hard state must be unchanged");
+    }
+
+    #[test]
+    fn restarted_follower_converges_with_leader() {
+        let (mut sim, leader_id) = elected_raft_cluster(3, &[1, 2, 3]);
+        let follower_id = sim
+            .nodes()
+            .keys()
+            .find(|&&id| id != leader_id)
+            .copied()
+            .unwrap();
+
+        sim.crash_node(follower_id);
+        assert!(sim.restart_node(follower_id));
+        sim.run(400);
+
+        let leader_last = sim.nodes()[&leader_id].log.last_index();
+        let follower_last = sim.nodes()[&follower_id].log.last_index();
+        assert_eq!(
+            leader_last, follower_last,
+            "follower must converge with leader after restart"
+        );
+    }
+
+    #[test]
+    fn group_commit_produces_one_sync_per_ae_batch() {
+        use crate::{
+            kv::{ClientRequest, Command},
+            raft::storage::Storage,
+        };
+        let (mut sim, leader_id) = elected_raft_cluster(7, &[1, 2, 3]);
+        let sync_before = sim.storage[&leader_id].sync_count();
+
+        // One client command → one AE proposal → one WriteBatch flush on the leader.
+        let cmd = ClientRequest::new(
+            1,
+            1,
+            Command::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        );
+        sim.step_node(
+            leader_id,
+            Input::ClientCommand(cmd.encode().expect("encode")),
+        );
+
+        let sync_after = sim.storage[&leader_id].sync_count();
+        assert_eq!(
+            sync_after - sync_before,
+            1,
+            "one AE proposal must produce exactly one storage sync on the leader"
+        );
+    }
+
+    #[test]
+    fn follower_acked_entry_survives_crash_restart() {
+        use crate::{
+            kv::{ClientRequest, Command},
+            raft::storage::Storage,
+        };
+
+        let (mut sim, leader_id) = elected_raft_cluster(11, &[1, 2, 3]);
+        let follower_id = sim
+            .nodes()
+            .keys()
+            .find(|&&id| id != leader_id)
+            .copied()
+            .unwrap();
+
+        let cmd = ClientRequest::new(
+            1,
+            1,
+            Command::Set {
+                key: b"survive".to_vec(),
+                value: b"1".to_vec(),
+            },
+        );
+        sim.step_node(
+            leader_id,
+            Input::ClientCommand(cmd.encode().expect("encode")),
+        );
+        // Replicate + commit path: followers must have drained PersistLog before ack.
+        sim.run(100);
+
+        let before = sim
+            .storage
+            .get(&follower_id)
+            .unwrap()
+            .recover()
+            .unwrap()
+            .log
+            .last_index();
+        assert!(
+            before >= 1,
+            "follower must have durable entries before crash, got {before}"
+        );
+
+        sim.crash_node(follower_id);
+        assert!(sim.restart_node(follower_id));
+
+        let after = sim
+            .storage
+            .get(&follower_id)
+            .unwrap()
+            .recover()
+            .unwrap()
+            .log
+            .last_index();
+        assert_eq!(
+            before, after,
+            "acked durable entries must survive crash/restart"
+        );
+        assert_eq!(
+            sim.nodes()[&follower_id].log().last_index(),
+            after,
+            "recovered node log must match storage"
+        );
+    }
+
+    #[test]
+    fn commit_failure_crashes_node_without_sending() {
+        use crate::{
+            kv::{ClientRequest, Command},
+            raft::storage::Storage,
+        };
+
+        let (mut sim, leader_id) = elected_raft_cluster(13, &[1, 2, 3]);
+        let follower_id = sim
+            .nodes()
+            .keys()
+            .find(|&&id| id != leader_id)
+            .copied()
+            .unwrap();
+
+        // Next durable write on the follower fails closed.
+        sim.storage
+            .get_mut(&follower_id)
+            .unwrap()
+            .fail_next_commits(1);
+
+        let sync_before = sim.storage[&follower_id].sync_count();
+        let cmd = ClientRequest::new(
+            1,
+            1,
+            Command::Set {
+                key: b"x".to_vec(),
+                value: b"y".to_vec(),
+            },
+        );
+        sim.step_node(
+            leader_id,
+            Input::ClientCommand(cmd.encode().expect("encode")),
+        );
+        // Deliver AE; follower PersistLog commit fails → crash, no success path.
+        sim.run(20);
+
+        assert!(
+            !sim.nodes().contains_key(&follower_id),
+            "follower must be crashed after commit failure"
+        );
+        assert_eq!(
+            sim.storage[&follower_id].sync_count(),
+            sync_before,
+            "failed commit must not increment sync_count"
+        );
+        assert!(
+            sim.storage[&follower_id].recover().is_ok(),
+            "pre-failure durable prefix must still recover"
+        );
     }
 }

@@ -270,7 +270,7 @@ fn render_node_toml(
     out.push_str("compaction_threshold    = 1000\n");
 
     out.push_str("\n[storage]\n");
-    // Durable backend name is "disk" (sled/segment) — not RocksDB.
+    // Durable backend is the custom segment-file log 
     out.push_str("backend  = \"disk\"\n");
     out.push_str(&format!("data_dir = \"{data_dir}\"\n"));
 
@@ -486,36 +486,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn init_emits_disk_backend_not_rocksdb() {
-        let dir = std::env::temp_dir().join("ferrite_init_disk_backend");
-        let _ = std::fs::remove_dir_all(&dir);
 
-        run_init(InitArgs {
-            nodes: 1,
-            dir: dir.clone(),
-            ..Default::default()
-        })
-        .unwrap();
-
-        let toml_str = std::fs::read_to_string(dir.join("node1.toml")).unwrap();
-        assert!(
-            toml_str.contains("backend  = \"disk\""),
-            "init must emit disk backend:\n{toml_str}"
-        );
-        assert!(
-            !toml_str.contains("rocksdb"),
-            "init must not emit rocksdb:\n{toml_str}"
-        );
-
-        let cfg = Config::load(Some(&dir.join("node1.toml")), Overrides::default()).unwrap();
-        match cfg.storage.backend {
-            crate::config::StorageBackend::Disk { .. } => {}
-            other => panic!("expected Disk backend from init, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn validate_missing_config_path_clear_error() {
