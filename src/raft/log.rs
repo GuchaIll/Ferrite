@@ -245,8 +245,7 @@ impl RaftLog {
         if self.contains(last_included_index, last_included_term) {
             //Boundary matches with local entry; the suffix after is still valid
             self.compact(last_included_index, last_included_term);
-        }
-        else{
+        } else {
             //Snapshot superceeds or conflicts with local entry, discard all
             self.entries.clear();
             self.start_index = last_included_index.saturating_add(1);

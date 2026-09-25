@@ -28,10 +28,31 @@ use crate::{
 ///
 /// `Memory` is for the simulator and unit tests. `Disk` opens the segment-file
 /// store under `data_dir` (blocking IO — call via `spawn_blocking` from async).
-pub fn open(backend: &StorageBackend) -> Result<Box<dyn Storage>, Error> {
+/// The `Send` bound is what lets a runtime driver move the backend onto a
+/// blocking thread for the duration of a `commit` and take it back afterwards,
+/// which is the only way to fsync without occupying an executor worker. Both
+/// backends are single-owner, so they are moved, never shared.
+pub fn open(backend: &StorageBackend) -> Result<Box<dyn Storage + Send>, Error> {
     match backend {
         StorageBackend::Memory => Ok(Box::new(MemoryStorage::default())),
         StorageBackend::Disk { data_dir } => Ok(Box::new(DiskStorage::open(data_dir)?)),
+    }
+}
+
+/// Lets a boxed backend be used wherever a concrete `S: Storage` is expected,
+/// so the runtime can choose its backend at startup while tests still pass a
+/// concrete recording type.
+impl Storage for Box<dyn Storage + Send> {
+    fn commit(&mut self, batch: &WriteBatch) -> Result<(), Error> {
+        (**self).commit(batch)
+    }
+
+    fn recover(&self) -> Result<Recovered, Error> {
+        (**self).recover()
+    }
+
+    fn sync_count(&self) -> u64 {
+        (**self).sync_count()
     }
 }
 
@@ -70,7 +91,7 @@ impl WriteBatch {
 
 // ── Storage trait ─────────────────────────────────────────────────────────────
 
-pub trait Storage {
+pub trait Storage: Send {
     /// Makes the whole batch durable; one sync per touched file.
     ///
     /// Blocking. Callers in an async context must run this via

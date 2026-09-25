@@ -1,6 +1,4 @@
-//! `ferrite` CLI — `validate` and `init` subcommands.
-//!
-//! The long-running Raft node binary is ticket #20.
+//! `ferrite` CLI — `validate`, `init`, and `run` subcommands.
 
 use std::path::PathBuf;
 
@@ -8,6 +6,7 @@ use clap::{Parser, Subcommand};
 use ferrite::{
     cli::{InitArgs, ValidateArgs, run_init, run_validate},
     config::StorageBackend,
+    server::run_node,
 };
 
 #[derive(Parser)]
@@ -80,16 +79,52 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Run the Raft node until SIGTERM or Ctrl-C.
+    ///
+    /// Serves the Raft peer service on `cluster.listen_addr` and joins the
+    /// cluster. Takes the same config and override flags as `validate`, and
+    /// refuses to start on anything `validate` would reject.
+    Run {
+        /// Path to the TOML config file.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+
+        /// Override cluster.peers entirely. Repeatable. Format: `<id>@<host:port>`.
+        #[arg(long = "peer", value_name = "ID@HOST:PORT")]
+        peers: Vec<String>,
+
+        /// Override cluster.client_endpoints entirely. Repeatable.
+        #[arg(long = "client-endpoint", value_name = "ID@HOST:PORT")]
+        client_endpoints: Vec<String>,
+
+        /// Override raft.heartbeat_interval_ms.
+        #[arg(long, value_name = "MS")]
+        heartbeat_interval_ms: Option<u64>,
+
+        /// Override raft.rpc_timeout_ms.
+        #[arg(long, value_name = "MS")]
+        rpc_timeout_ms: Option<u64>,
+
+        /// Override raft.election_timeout_min_ms.
+        #[arg(long, value_name = "MS")]
+        election_timeout_min_ms: Option<u64>,
+
+        /// Override raft.election_timeout_max_ms.
+        #[arg(long, value_name = "MS")]
+        election_timeout_max_ms: Option<u64>,
+    },
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -154,6 +189,37 @@ fn run() -> anyhow::Result<()> {
             for path in &written {
                 println!("wrote {}", path.display());
             }
+        }
+
+        Commands::Run {
+            config,
+            peers,
+            client_endpoints,
+            heartbeat_interval_ms,
+            rpc_timeout_ms,
+            election_timeout_min_ms,
+            election_timeout_max_ms,
+        } => {
+            // Same validation path as `ferrite validate`: a node that would fail
+            // validation must not start half-configured.
+            let cfg = run_validate(ValidateArgs {
+                config,
+                peers,
+                client_endpoints,
+                heartbeat_interval_ms,
+                rpc_timeout_ms,
+                election_timeout_min_ms,
+                election_timeout_max_ms,
+            })?;
+
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+
+            run_node(cfg).await?;
         }
     }
 

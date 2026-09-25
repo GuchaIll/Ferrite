@@ -270,7 +270,7 @@ fn render_node_toml(
     out.push_str("compaction_threshold    = 1000\n");
 
     out.push_str("\n[storage]\n");
-    // Durable backend is the custom segment-file log 
+    // Durable backend is the custom segment-file log
     out.push_str("backend  = \"disk\"\n");
     out.push_str(&format!("data_dir = \"{data_dir}\"\n"));
 
@@ -485,8 +485,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-
 
     #[test]
     fn validate_missing_config_path_clear_error() {

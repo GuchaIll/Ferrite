@@ -158,24 +158,24 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, StorageError> {
         }
 
         let op = match kind {
-            KIND_APPEND => LogOp::Append(from_bincode::<LogEntry>(payload).map_err(|e| {
-                match e {
+            KIND_APPEND => {
+                LogOp::Append(from_bincode::<LogEntry>(payload).map_err(|e| match e {
                     StorageError::Corruption { .. } => StorageError::Corruption {
                         segment: None,
                         offset: pos as u64,
                     },
                     other => other,
-                }
-            })?),
-            KIND_TRUNCATE => LogOp::TruncateFrom(from_bincode::<u64>(payload).map_err(|e| {
-                match e {
+                })?)
+            }
+            KIND_TRUNCATE => {
+                LogOp::TruncateFrom(from_bincode::<u64>(payload).map_err(|e| match e {
                     StorageError::Corruption { .. } => StorageError::Corruption {
                         segment: None,
                         offset: pos as u64,
                     },
                     other => other,
-                }
-            })?),
+                })?)
+            }
             _ => {
                 if is_last_record {
                     break; // unknown kind on final record → torn tail

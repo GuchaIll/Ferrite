@@ -746,7 +746,10 @@ mod tests {
 
         let s2 = open(tmp.path());
         let r = s2.recover().unwrap();
-        assert_eq!(r.hard_state, hs, "previous hard state must win over leftover tmp");
+        assert_eq!(
+            r.hard_state, hs,
+            "previous hard state must win over leftover tmp"
+        );
         assert!(
             !tmp.path().join("hard_state.tmp").exists(),
             "tmp cleaned on open"

@@ -143,29 +143,48 @@ pub(crate) fn handle_append_entries_response(
     catch_up_peer(node, from)
 }
 
-/// Appends a client command on the leader and replicates to all peers.
-pub(crate) fn append_and_replicate(node: &mut RaftNode, command: Vec<u8>) -> Vec<ElectionAction> {
+/// Appends one or more client commands on the leader and replicates once.
+///
+/// All commands become contiguous log entries in the leader's current term.
+/// The leader emits a single [`ElectionAction::PersistLog`] covering the whole
+/// batch, then one AppendEntries/InstallSnapshot catch-up per peer. Callers
+/// (issue 04 actor) should drain the proposal queue into one batch so N
+/// proposals share one fsync instead of N.
+///
+/// An empty `commands` list is a no-op. Non-leaders return a single redirect.
+pub(crate) fn append_and_replicate(
+    node: &mut RaftNode,
+    commands: Vec<Vec<u8>>,
+) -> Vec<ElectionAction> {
+    if commands.is_empty() {
+        return Vec::new();
+    }
     if node.state != RaftState::Leader {
         return vec![ElectionAction::RedirectLeader {
             leader_hint: node.leader_id,
         }];
     }
 
-    let entry = LogEntry {
-        index: node.log.next_index(),
-        term: node.current_term,
-        command,
-    };
-
-    if node.log.append(entry.clone()).is_err() {
-        // Unreachable for a contiguous leader log; refuse rather than panic.
-        return Vec::new();
+    let mut entries = Vec::with_capacity(commands.len());
+    for command in commands {
+        let entry = LogEntry {
+            index: node.log.next_index(),
+            term: node.current_term,
+            command,
+        };
+        if node.log.append(entry.clone()).is_err() {
+            // Unreachable for a contiguous leader log; refuse rather than panic.
+            // Drop any partial in-memory appends is impossible here: append only
+            // fails on gap, and we always append at next_index.
+            return Vec::new();
+        }
+        entries.push(entry);
     }
 
-    // The leader's own copy is durable before any follower can ack it.
+    // The leader's own copies are durable before any follower can ack them.
     let mut actions = vec![ElectionAction::PersistLog {
         truncate_from: None,
-        entries: vec![entry],
+        entries,
     }];
     actions.extend(broadcast_append_entries(node));
     actions
@@ -366,7 +385,6 @@ mod tests {
             _ => unreachable!(),
         }
     }
-
 
     fn ae(
         term: u64,
@@ -597,7 +615,7 @@ mod tests {
     fn leader_appends_locally_before_replicate_actions() {
         let mut node = leader_with_log(&[]);
         node.current_term = 1;
-        let actions = append_and_replicate(&mut node, b"cmd".to_vec());
+        let actions = append_and_replicate(&mut node, vec![b"cmd".to_vec()]);
         assert_eq!(node.log.last_index(), 1);
         assert_eq!(node.log.entry(1).unwrap().command, b"cmd");
         assert_eq!(
@@ -626,6 +644,51 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].command, b"cmd");
         }
+    }
+
+    #[test]
+    fn leader_batches_multiple_commands_one_persist_one_broadcast() {
+        let mut node = leader_with_log(&[]);
+        node.current_term = 1;
+        let actions =
+            append_and_replicate(&mut node, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(node.log.last_index(), 3);
+        let (truncate, entries) = persist_log_before_sends(&actions);
+        assert_eq!(truncate, None);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].command, b"a");
+        assert_eq!(entries[1].command, b"b");
+        assert_eq!(entries[2].command, b"c");
+        // Exactly one PersistLog in the whole action list.
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, ElectionAction::PersistLog { .. }))
+                .count(),
+            1
+        );
+        let sends: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ElectionAction::Send {
+                    rpc: RaftRpc::AppendEntries(req),
+                    ..
+                } => Some(req.entries.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends.len(), 2);
+        for entries in sends {
+            assert_eq!(entries.len(), 3, "one AE carries the full batch");
+        }
+    }
+
+    #[test]
+    fn empty_batch_is_noop() {
+        let mut node = leader_with_log(&[]);
+        let actions = append_and_replicate(&mut node, Vec::new());
+        assert!(actions.is_empty());
+        assert_eq!(node.log.last_index(), 0);
     }
 
     // ── handle_append_entries_response: backoff walk ──────────────────────
@@ -663,7 +726,7 @@ mod tests {
         leader.current_term = 1;
 
         // The request to peer 2 covers index 1 only; hold it back in flight.
-        let delayed = append_and_replicate(&mut leader, b"a".to_vec())
+        let delayed = append_and_replicate(&mut leader, vec![b"a".to_vec()])
             .into_iter()
             .find_map(|a| match a {
                 ElectionAction::Send {
@@ -676,7 +739,7 @@ mod tests {
         assert_eq!(delayed.prev_log_index + delayed.entries.len() as u64, 1);
 
         // The leader grows its log before the older reply arrives.
-        append_and_replicate(&mut leader, b"b".to_vec());
+        append_and_replicate(&mut leader, vec![b"b".to_vec()]);
         assert_eq!(leader.log.last_index(), 2);
 
         // Real follower path produces the reply to the older, shorter request.

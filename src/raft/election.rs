@@ -288,9 +288,7 @@ fn start_election(node: &mut RaftNode) -> Vec<ElectionAction> {
         });
     }
 
-    let voters = node.peers.len() + 1;
-    let quorum = voters / 2 + 1;
-    if node.election.votes_granted.len() >= quorum {
+    if node.election.votes_granted.len() >= quorum(node) {
         actions.extend(become_leader(node));
     }
 
@@ -300,19 +298,30 @@ fn start_election(node: &mut RaftNode) -> Vec<ElectionAction> {
 fn tally_granted_vote(node: &mut RaftNode, from: NodeId) -> Vec<ElectionAction> {
     node.election.votes_granted.insert(from);
 
-    let voters = node.peers.len() + 1;
-    let quorum = voters / 2 + 1;
-    if node.election.votes_granted.len() >= quorum {
+    if node.election.votes_granted.len() >= quorum(node) {
         return become_leader(node);
     }
 
     Vec::new()
 }
 
+/// Votes needed to win an election.
+///
+/// `peers` is filtered for this node's own id, matching how
+/// [`crate::raft::replication`] sizes the cluster for commit. Both must agree:
+/// if one counts a self-entry in `peers` as an extra voter and the other does
+/// not, a three-node cluster needs three votes to elect but only two to commit,
+/// and it simply stops electing leaders the moment any node is down. Config is
+/// the likely source of a self-entry, so tolerating it beats trusting it.
+fn quorum(node: &RaftNode) -> usize {
+    let voters = 1 + node.peers.iter().filter(|&&peer| peer != node.id).count();
+    voters / 2 + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ElectionAction, ElectionState, handle_request_vote_response, is_log_up_to_date,
+        ElectionAction, ElectionState, handle_request_vote_response, is_log_up_to_date, quorum,
         reset_timeout,
     };
     use crate::raft::{
@@ -463,6 +472,19 @@ mod tests {
         );
         // No peers → no AppendEntries Sends.
         assert!(ae_sends(&actions).is_empty());
+    }
+
+    #[test]
+    fn quorum_ignores_this_node_appearing_in_its_own_peer_list() {
+        // A config that lists every member, this node included, is the obvious
+        // way to write one. Counting the self-entry as a fourth voter in a
+        // three-node cluster would demand unanimity to elect while commit still
+        // needed two — the cluster would stop electing as soon as one node died.
+        let with_self = RaftNode::new(1, vec![1, 2, 3]);
+        let without_self = RaftNode::new(1, vec![2, 3]);
+
+        assert_eq!(quorum(&with_self), 2);
+        assert_eq!(quorum(&without_self), 2);
     }
 
     #[test]

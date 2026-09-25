@@ -6,6 +6,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::config::NodeId;
 
+pub mod driver;
 pub mod election;
 pub mod invariant;
 pub mod log;
@@ -14,10 +15,11 @@ pub mod snapshot;
 pub mod state;
 pub mod storage;
 
+pub use driver::{Input, Output};
 pub use election::ElectionState;
 pub use log::{LogEntry, RaftLog};
-use state::RaftState;
 pub use snapshot::{Snapshot, SnapshotMeta};
+use state::RaftState;
 pub use storage::HardState;
 
 const DEFAULT_ELECTION_TIMEOUT_TICKS: u64 = 500;
@@ -68,7 +70,6 @@ pub struct InstallSnapshotRequest {
     pub data: Vec<u8>,
     pub done: bool,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSnapshotResponse {
@@ -250,6 +251,41 @@ impl RaftNode {
         self.current_term
     }
 
+    /// Returns the node this one believes is leader, if any.
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.leader_id
+    }
+
+    /// Installs tick budgets derived from a driver's tick period.
+    ///
+    /// The core counts ticks and never reads a clock, so the conversion from
+    /// configured wall-clock durations into a number of ticks belongs to the
+    /// driver. The simulator keeps the compiled-in defaults.
+    ///
+    /// Resets the election timer, because a countdown sampled from the previous
+    /// range is not a legal value in the new one — carrying it over is how a
+    /// node ends up with a timeout longer than the leader's heartbeat and never
+    /// stands for election, or shorter and never stops.
+    pub fn set_tick_budget(
+        &mut self,
+        heartbeat_ticks: u64,
+        election_timeout_min_ticks: u64,
+        election_timeout_max_ticks: u64,
+    ) {
+        self.heartbeat_interval_ticks = heartbeat_ticks.max(1);
+        self.election_timeout_min_ticks = election_timeout_min_ticks.max(1);
+        self.election_timeout_max_ticks =
+            election_timeout_max_ticks.max(self.election_timeout_min_ticks);
+
+        let range = self.election_timeout_min_ticks..=self.election_timeout_max_ticks;
+        election::reset_timeout(&mut self.election, range, &mut self.rng);
+    }
+
+    /// Sets how many applied entries trigger a snapshot request; 0 disables it.
+    pub fn set_compaction_threshold(&mut self, entries: u64) {
+        self.compaction_threshold = entries;
+    }
+
     /// Advances the protocol's logical clock by one driver tick.
     /// Returns ordered effects for the runtime.
     pub(crate) fn on_tick(&mut self) -> Vec<election::ElectionAction> {
@@ -314,7 +350,19 @@ impl RaftNode {
         &mut self,
         command: Vec<u8>,
     ) -> Vec<election::ElectionAction> {
-        replication::append_and_replicate(self, command)
+        self.handle_client_commands(vec![command])
+    }
+
+    /// Handles a batch of serialized client commands in one step.
+    ///
+    /// Opportunistic batching: the driver drains every proposal currently
+    /// queued and delivers them together so one `PersistLog` and one
+    /// AppendEntries round covers the whole batch.
+    pub(crate) fn handle_client_commands(
+        &mut self,
+        commands: Vec<Vec<u8>>,
+    ) -> Vec<election::ElectionAction> {
+        replication::append_and_replicate(self, commands)
     }
 
     /// Handles snapshot bytes produced by the driver after [`ElectionAction::RequestSnapshot`].
