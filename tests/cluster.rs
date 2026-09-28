@@ -36,9 +36,7 @@ use ferrite::{
         LogEntry,
         storage::{self, Storage},
     },
-    server::{
-        Applied, NodeError, NodeHandle, raft_service::RaftServiceImpl, run::spawn_node,
-    },
+    server::{Applied, NodeError, NodeHandle, raft_service::RaftServiceImpl, run::spawn_node},
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
