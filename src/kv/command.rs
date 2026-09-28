@@ -82,6 +82,7 @@ pub enum CasOutcome {
 mod tests {
     use super::Command;
 
+
     fn round_trip(command: &Command) {
         let encoded = command.encode().expect("encode");
         let decoded = Command::decode(&encoded).expect("decode");

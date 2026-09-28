@@ -30,6 +30,7 @@ use crate::{
     kv::KvStateMachine,
     raft::storage::{LogOp, MemoryStorage, Storage, WriteBatch},
     raft::{RaftNode, invariant::InvariantChecker},
+    transport::Transport,
 };
 pub use io::{Input, Output};
 
@@ -336,8 +337,15 @@ impl<N: SimNode> Simulator<N> {
                     Some(from),
                     None,
                 ));
-                self.network.enqueue(from, to, rpc);
+                // Through the trait, not `Network::enqueue` directly: the
+                // runtime driver's only difference at this line is which
+                // `Transport` it holds.
+                Transport::send(&mut self.network, from, to, rpc);
             }
+            // The simulator has no clients waiting on a reply, so there is
+            // nobody to redirect. Deliberately untraced: a driver-local
+            // decision is not a distributed event.
+            Output::Redirect { .. } => {}
             // Persist variants are accumulated before dispatch_output is called.
             Output::Persist(_) | Output::PersistLog { .. } | Output::PersistSnapshot(_) => {}
         }
@@ -559,6 +567,7 @@ mod tests {
                 ],
                 Input::Message { .. }
                 | Input::ClientCommand(_)
+                | Input::ClientCommands(_)
                 | Input::SnapshotTaken(_)
                 | Input::SnapshotPersisted(_) => Vec::new(),
             }
@@ -1061,6 +1070,60 @@ mod tests {
             1,
             "one AE proposal must produce exactly one storage sync on the leader"
         );
+    }
+
+    #[test]
+    fn batched_client_commands_one_leader_sync_and_commit_all() {
+        use crate::{
+            kv::{ClientRequest, Command},
+            raft::storage::Storage,
+        };
+
+        let (mut sim, leader_id) = elected_raft_cluster(13, &[1, 2, 3]);
+        let base = sim.nodes()[&leader_id].log.last_index();
+        let sync_before = sim.storage[&leader_id].sync_count();
+
+        let commands: Vec<Vec<u8>> = (0..8)
+            .map(|i| {
+                ClientRequest::new(
+                    1,
+                    i + 1,
+                    Command::Set {
+                        key: format!("k{i}").into_bytes(),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .encode()
+                .expect("encode")
+            })
+            .collect();
+
+        sim.step_node(leader_id, Input::ClientCommands(commands));
+
+        let sync_after_propose = sim.storage[&leader_id].sync_count();
+        assert_eq!(
+            sync_after_propose - sync_before,
+            1,
+            "eight commands in one step must share one leader storage sync"
+        );
+        let expected_last = base + 8;
+        assert_eq!(sim.nodes()[&leader_id].log.last_index(), expected_last);
+
+        // Replicate and commit the batch.
+        sim.run(100);
+
+        assert_eq!(
+            sim.nodes()[&leader_id].commit_index,
+            expected_last,
+            "full batch must commit under majority"
+        );
+        for id in [1u64, 2, 3] {
+            assert_eq!(
+                sim.nodes()[&id].log.last_index(),
+                expected_last,
+                "node {id} must hold the full batch"
+            );
+        }
     }
 
     #[test]

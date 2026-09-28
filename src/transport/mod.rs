@@ -1,36 +1,35 @@
-//! Raft transport abstraction.
+//! The transport boundary: how an [`Output::Send`] leaves a node.
+//!
+//! [`Output::Send`]: crate::raft::Output::Send
+//!
+//! One synchronous method, implemented twice — by the simulator's network and
+//! by the gRPC peer transport. Synchronous is the load-bearing part:
+//!
+//! - The core never waits for a reply. Responses re-enter as
+//!   [`Input::Message`], so `send` has nothing to return and no reason to
+//!   suspend.
+//! - A driver cannot accidentally make delivery a back-pressure point on
+//!   consensus. Raft tolerates lost messages; it does not tolerate a leader
+//!   stalling on one unreachable follower.
+//! - The simulator stays free of futures, which is what its determinism gate
+//!   enforces.
+//!
+//! [`Input::Message`]: crate::raft::Input::Message
+//!
+//! Implementations must not block. Dropping a message is always a legal
+//! response to a full queue or a dead peer.
 
-use crate::config::NodeId;
-use crate::error::TransportError;
-use crate::raft::log::LogEntry;
+use crate::{config::NodeId, raft::RaftRpc};
 
+pub mod convert;
 pub mod grpc;
-pub mod simulated;
 
-/// `AppendEntries` RPC arguments, sent by a leader to a follower.
-#[derive(Debug, Clone)]
-pub struct AppendEntriesRequest {
-    pub term: u64,
-    pub leader_id: NodeId,
-    pub prev_log_index: u64,
-    pub prev_log_term: u64,
-    pub entries: Vec<LogEntry>,
-    pub leader_commit: u64,
-}
-
-/// `AppendEntries` RPC result, returned by a follower to the leader.
-#[derive(Debug, Clone)]
-pub struct AppendEntriesResponse {
-    pub term: u64,
-    pub success: bool,
-}
-
-/// Sends Raft RPCs to peer nodes. Implementations must not block the async
-/// executor; network I/O belongs behind `tokio::*`, never `std::net`.
+/// Carries Raft RPCs between nodes.
 pub trait Transport {
-    async fn append_entries(
-        &self,
-        to: NodeId,
-        request: AppendEntriesRequest,
-    ) -> Result<AppendEntriesResponse, TransportError>;
+    /// Hands `rpc` off for delivery to `to`, without blocking and without
+    /// waiting for a reply.
+    ///
+    /// Delivery is best-effort by design: an implementation that cannot take
+    /// the message right now must drop it and return, never stall the caller.
+    fn send(&mut self, from: NodeId, to: NodeId, rpc: RaftRpc);
 }

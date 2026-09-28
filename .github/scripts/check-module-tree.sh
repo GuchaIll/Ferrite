@@ -13,8 +13,6 @@ fi
 
 # Known orphans, each with the issue that resolves it. Remove entries as they land.
 allowed_unreachable=(
-    "src/transport/mod.rs"    # issue 04 rewires transport into the crate
-    "src/transport/grpc.rs"   # issue 04
     "src/kv/kv_client.rs"     # empty placeholder for issue 05's client
 )
 
