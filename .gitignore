@@ -25,3 +25,14 @@ Thumbs.db
 *.pdb
 dist/
 *.log
+
+# Node runtime data written by `ferrite run`.
+#
+# `ferrite init` emits `data_dir = "./data/nodeN"`, which resolves against the
+# *process working directory*, so running a node from the repo root drops a live
+# Raft log here. The file patterns are a safety net for a data_dir pointed
+# somewhere else in the tree: a segment log or a hard-state file is durable
+# consensus state and never belongs in version control.
+/data/
+*.seg
+hard_state
