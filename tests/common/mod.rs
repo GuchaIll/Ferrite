@@ -1,7 +1,7 @@
-//! Shared in-process cluster harness for `tests/cluster.rs`.
+//! Shared in-process cluster harness for `tests/cluster.rs` and `tests/kv.rs`.
 //!
-//! Each node is `spawn_node` plus a Raft server on a listener the harness
-//! already bound. No KV server runs; `kv_advertise` only fills the config.
+//! Each node is the same assembly `ferrite run` builds: `spawn_node` plus a Raft
+//! server and a KV server, each on a listener the harness already bound.
 
 // Each test binary compiles this module and uses a different subset of it.
 #![allow(dead_code)]
@@ -12,21 +12,25 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ferrite::{
+    client::{ClientConfig, KvClient},
     config::{
         ClusterConfig, Config, LoggingConfig, NodeId, RaftConfig, RaftPeer, StorageBackend,
         StorageConfig,
     },
+    proto::kv::kv_client::KvClient as KvStub,
+    proto::kv::kv_server::KvServer,
     proto::raft::raft_service_server::RaftServiceServer,
     raft::{
         LogEntry,
         storage::{self, Storage},
     },
-    server::{Applied, NodeHandle, raft_service::RaftServiceImpl, run::spawn_node},
+    server::{Applied, KvServiceImpl, NodeHandle, raft_service::RaftServiceImpl, run::spawn_node},
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Channel, Endpoint};
 
 /// Timing tuned for a loopback cluster: fast enough that a test finishes in
 /// seconds, slow enough that a debug-build fsync does not trip an election.
@@ -71,12 +75,11 @@ impl TestCluster {
         for id in 1..=total {
             let raft = TcpListener::bind("127.0.0.1:0").await.expect("bind raft");
             // Its own ephemeral port, not raft + offset: a computed port can
-            // already be taken by another test binary. Dropped once the address
-            // is known; nothing serves KV here.
+            // already be taken by another test binary.
             let kv = TcpListener::bind("127.0.0.1:0").await.expect("bind kv");
             raft_addrs.insert(id, raft.local_addr().expect("addr"));
             kv_advertise.insert(id, kv.local_addr().expect("addr"));
-            listeners.insert(id, raft);
+            listeners.insert(id, (raft, kv));
         }
 
         let mut peers = BTreeMap::new();
@@ -100,8 +103,8 @@ impl TestCluster {
         };
 
         for id in run.iter().copied() {
-            let raft = listeners.remove(&id).expect("listeners");
-            let _ = cluster.spawn_running(id, raft).await;
+            let (raft, kv) = listeners.remove(&id).expect("listeners");
+            let _ = cluster.spawn_running(id, raft, kv).await;
         }
 
         cluster
@@ -128,19 +131,25 @@ impl TestCluster {
         }
     }
 
-    /// Spawns actor + Raft server for `id`, using the durable directory already
-    /// registered for that id.
+    /// Spawns actor + Raft and KV servers for `id`, using the durable directory
+    /// already registered for that id.
     ///
     /// Returns an apply subscription taken before this future yields again.
     async fn spawn_running(
         &mut self,
         id: NodeId,
         listener: TcpListener,
+        kv_listener: TcpListener,
     ) -> tokio::sync::broadcast::Receiver<Applied> {
         assert_eq!(
             listener.local_addr().expect("addr"),
             self.raft_addrs[&id],
             "restart must rebind the same Raft address peers already know"
+        );
+        assert_eq!(
+            kv_listener.local_addr().expect("addr"),
+            self.kv_advertise[&id],
+            "restart must rebind the same KV address clients were given"
         );
 
         let config = self.config_for(id);
@@ -151,6 +160,22 @@ impl TestCluster {
         // Subscribe before any await so catch-up applies are less likely to be
         // missed between actor start and the caller's first poll.
         let apply_rx = runtime.handle.subscribe_apply();
+
+        // Cloned: the harness keeps `runtime.handle` in `nodes`, and a handle is
+        // a bundle of channel senders. The map is cloned once per node start.
+        let kv_service = KvServiceImpl::new(runtime.handle.clone(), self.kv_advertise.clone());
+        let mut kv_shutdown = shutdown_rx.clone();
+        self.tasks.spawn(async move {
+            let served = tonic::transport::Server::builder()
+                .add_service(KvServer::new(kv_service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(kv_listener), async move {
+                    let _ = kv_shutdown.changed().await;
+                })
+                .await;
+            if let Err(error) = served {
+                eprintln!("node {id} kv server stopped: {error}");
+            }
+        });
 
         let mut serve_shutdown = shutdown_rx;
         self.tasks.spawn(async move {
@@ -187,23 +212,29 @@ impl TestCluster {
             "no data dir registered for node {id}"
         );
 
-        // Port release after cooperative stop can lag slightly on loopback.
-        let addr = self.raft_addrs[&id];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        let listener = loop {
-            match TcpListener::bind(addr).await {
-                Ok(listener) => break listener,
-                Err(error) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "could not rebind {addr} for node {id}: {error}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+        // Raft address first, then KV. Port release after cooperative stop can
+        // lag slightly on loopback.
+        let mut rebound = Vec::with_capacity(2);
+        for addr in [self.raft_addrs[&id], self.kv_advertise[&id]] {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let listener = loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => break listener,
+                    Err(error) => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "could not rebind {addr} for node {id}: {error}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
                 }
-            }
-        };
+            };
+            rebound.push(listener);
+        }
+        let kv_listener = rebound.pop().expect("kv listener");
+        let listener = rebound.pop().expect("raft listener");
 
-        self.spawn_running(id, listener).await
+        self.spawn_running(id, listener, kv_listener).await
     }
 
     /// Waits until some running node reports itself leader.
@@ -263,6 +294,29 @@ impl TestCluster {
             let _ = shutdown.send(true);
         }
         self.tasks.shutdown().await;
+    }
+
+    /// A client whose endpoint list starts at `first`, so a test controls which
+    /// node it tries before any redirect.
+    pub fn client(&self, first: NodeId, request_timeout: Duration) -> KvClient {
+        let first_addr = self.kv_advertise[&first];
+        let mut endpoints: Vec<SocketAddr> = self.kv_advertise.values().copied().collect();
+        // Stable sort on `false < true`: `first` moves to the front, the rest keep order.
+        endpoints.sort_by_key(|&addr| addr != first_addr);
+        KvClient::new(ClientConfig {
+            endpoints,
+            request_timeout,
+            attempt_timeout: Duration::from_millis(500),
+        })
+        .expect("client")
+    }
+
+    /// A raw stub to one node's KV port, for tests that must control `seq_num`.
+    pub fn kv_stub(&self, id: NodeId) -> KvStub<Channel> {
+        let channel = Endpoint::from_shared(format!("http://{}", self.kv_advertise[&id]))
+            .expect("kv uri")
+            .connect_lazy();
+        KvStub::new(channel)
     }
 }
 
