@@ -50,6 +50,10 @@ message AppendEntriesRequest {
 message AppendEntriesResponse {
     uint64 term =1;
     bool success =2;
+    //last log index the responder actually acknowledged (0 on rejection).
+    //the leader sets matchIndex/nextIndex from this instead of guessing, so a
+    //rejection costs one round trip rather than a decrement-and-retry walk
+    uint64 match_index =3;
 }
 
 //when a follower is so far behind that the leader no longer has the log entries need to catch it up
@@ -75,8 +79,33 @@ message InstallSnapshotResponse {
     uint64 term =1;
 }
 
+//One envelope for every Raft message, request and response alike.
+//
+//The consensus core never blocks waiting for a reply: it emits a response as
+//just another outbound message, and a reply re-enters the receiver as an
+//ordinary input. So a response has to be *sendable*, which a unary return value
+//is not. Mapping all six onto one fire-and-forget method is what lets the
+//simulator and the running node drive the core through the identical sequence
+//of inputs, rather than one of them turning replies inside out.
+//
+//`from` is on the envelope because the receiver needs the sender's node id to
+//route a reply, and a TCP peer address is not a Raft identity.
+message RaftMessage {
+    uint64 from =1;
+    oneof payload {
+        RequestVoteRequest request_vote =2;
+        RequestVoteResponse request_vote_response =3;
+        AppendEntriesRequest append_entries =4;
+        AppendEntriesResponse append_entries_response =5;
+        InstallSnapshotRequest install_snapshot =6;
+        InstallSnapshotResponse install_snapshot_response =7;
+    }
+}
+
+//Deliberately empty. Accepting a message says nothing about having handled it;
+//the answer, when there is one, arrives as its own RaftMessage.
+message Ack {}
+
 service RaftService {
-    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
-    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
-    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+    rpc Deliver(RaftMessage) returns (Ack);
 }

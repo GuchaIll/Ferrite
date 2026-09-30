@@ -1,17 +1,15 @@
 //! Deterministic-simulation adapter for the Raft state machine.
 
-use crate::{
-    config::NodeId,
-    raft::{RaftNode, election::ElectionAction},
-};
+use crate::{config::NodeId, raft::RaftNode};
 
 use super::{Input, Output, SimNode};
 
 /// Lets the simulation driver deliver its orchestration inputs to a Raft node.
 ///
-/// This adapter keeps simulation-specific `Input` and `Output` types out of
-/// the Raft core. As protocol handling is implemented, it will translate Raft
-/// effects into ordered driver outputs.
+/// Both halves of the work live in the core: [`RaftNode::step`] is the driver
+/// contract, and this impl only makes a `RaftNode` usable wherever the
+/// simulator is generic over its nodes. A runtime driver calls `step` directly
+/// and needs none of this.
 impl SimNode for RaftNode {
     fn id(&self) -> NodeId {
         RaftNode::id(self)
@@ -22,40 +20,8 @@ impl SimNode for RaftNode {
     }
 
     fn step(&mut self, input: Input) -> Vec<Output> {
-        let actions = match input {
-            Input::Tick => self.on_tick(),
-            Input::Message { from, rpc } => self.handle_rpc(from, rpc),
-            Input::ClientCommand(command) => self.handle_client_command(command),
-            Input::SnapshotTaken(snapshot) => self.handle_snapshot_taken(snapshot),
-            Input::SnapshotPersisted(meta) => self.handle_snapshot_persisted(meta),
-        };
-        actions_to_outputs(actions)
+        RaftNode::step(self, input)
     }
-}
-
-// Core effects -> driver outputs
-fn actions_to_outputs(actions: Vec<ElectionAction>) -> Vec<Output> {
-    actions
-        .into_iter()
-        .filter_map(|action| match action {
-            ElectionAction::Persist(hard_state) => Some(Output::Persist(hard_state)),
-            ElectionAction::Send { to, rpc } => Some(Output::Send { to, rpc }),
-            // Role / redirect effects are already reflected in Raft core state.
-            ElectionAction::PromoteLeader
-            | ElectionAction::DemoteFollower
-            | ElectionAction::RedirectLeader { .. } => None,
-            ElectionAction::ApplyCommittedEntries { entry } => Some(Output::Apply(entry)),
-            ElectionAction::RequestSnapshot {
-                last_included_index,
-                last_included_term,
-            } => Some(Output::RequestSnapshot {
-                last_included_index,
-                last_included_term,
-            }),
-            ElectionAction::PersistSnapshot(snapshot) => Some(Output::PersistSnapshot(snapshot)),
-            ElectionAction::ApplySnapshot(snapshot) => Some(Output::ApplySnapshot(snapshot)),
-        })
-        .collect()
 }
 
 #[cfg(test)]

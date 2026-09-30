@@ -28,6 +28,10 @@ pub enum TransportError {
 pub enum StorageError {
     #[error("storage error: {0}")]
     Internal(String),
+    #[error("storage corruption at segment {segment:?}, offset {offset}")]
+    Corruption { segment: Option<u64>, offset: u64 },
+    #[error("storage io error")]
+    Io(#[from] std::io::Error),
 }
 
 /// Crate-level error, flattening errors from each module.

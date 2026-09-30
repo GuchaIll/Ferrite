@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::{config::NodeId, raft::RaftRpc};
+use crate::{config::NodeId, raft::RaftRpc, transport::Transport};
 
 /// One in-flight RPC waiting for delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,5 +62,15 @@ impl Network {
     /// Returns the number of queued RPCs.
     pub fn len(&self) -> usize {
         self.queue.len()
+    }
+}
+
+/// The simulated network is one of the two transports the driver contract
+/// allows. Enqueueing is already non-blocking and already drops messages for
+/// isolated nodes, so the trait adds no behavior here — it only guarantees the
+/// simulator and the runtime node reach the wire through the same interface.
+impl Transport for Network {
+    fn send(&mut self, from: NodeId, to: NodeId, rpc: RaftRpc) {
+        self.enqueue(from, to, rpc);
     }
 }

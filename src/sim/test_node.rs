@@ -34,6 +34,7 @@ impl SimNode for EchoNode {
             }],
             Input::Message { .. }
             | Input::ClientCommand(_)
+            | Input::ClientCommands(_)
             | Input::SnapshotTaken(_)
             | Input::SnapshotPersisted(_) => Vec::new(),
         }
