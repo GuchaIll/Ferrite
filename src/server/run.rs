@@ -16,9 +16,11 @@ use tonic::transport::Server;
 use crate::{
     config::{Config, NodeId},
     kv::KvStateMachine,
+    proto::kv::kv_server::KvServer,
     proto::raft::raft_service_server::RaftServiceServer,
     raft::{RaftNode, storage},
     server::{
+        kv_service::KvServiceImpl,
         node::{self, NodeParts, NodeRuntime, TickSchedule},
         raft_service::RaftServiceImpl,
     },
@@ -97,30 +99,43 @@ pub async fn run_node(config: Config) -> Result<(), RunError> {
     let runtime = spawn_node(&config, &mut tasks, shutdown_rx.clone()).await?;
 
     let raft_bind = config.cluster.raft_bind;
+    let kv_bind = config.cluster.kv_bind;
+
     tracing::info!(
         node_id = id,
         %raft_bind,
+        %kv_bind,
         peers = config.cluster.peers.len(),
         quorum = config.cluster.quorum(),
-        "serving raft"
+        "serving"
     );
 
-    let mut serve_shutdown = shutdown_rx.clone();
-    let serving = Server::builder()
+    let mut raft_shutdown = shutdown_rx.clone();
+    let raft_server = Server::builder()
         .add_service(RaftServiceServer::new(RaftServiceImpl::new(
             runtime.inbound,
         )))
         .serve_with_shutdown(raft_bind, async move {
             // `changed()` only errs when every sender is gone, which is also a
             // shutdown; either way stop serving.
-            let _ = serve_shutdown.changed().await;
+            let _ = raft_shutdown.changed().await;
         });
 
-    let signal = wait_for_shutdown_signal();
+    let mut kv_shutdown = shutdown_rx.clone();
+    // Moved, not cloned: `run_node` owns the config and nothing reads this field again.
+    let kv_server = Server::builder()
+        .add_service(KvServer::new(KvServiceImpl::new(
+            runtime.handle,
+            config.cluster.kv_advertise,
+        )))
+        .serve_with_shutdown(kv_bind, async move {
+            let _ = kv_shutdown.changed().await;
+        });
 
     let result = tokio::select! {
-        served = serving => served.map_err(|source| RunError::Serve { addr: raft_bind, source }),
-        () = signal => Ok(()),
+        served = raft_server => served.map_err(|source| RunError::Serve { addr: raft_bind, source }),
+        served = kv_server => served.map_err(|source| RunError::Serve { addr: kv_bind, source }),
+        () = wait_for_shutdown_signal() => Ok(()),
     };
 
     tracing::info!(node_id = id, "shutting down");

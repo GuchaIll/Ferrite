@@ -63,7 +63,8 @@ fn main() -> Result<()> {
                     "scenario=replicate seed={seed} leader={:?} writes={} log_len={} identical={}",
                     result.leader_id, result.writes, result.log_len, result.logs_identical
                 );
-                if !result.logs_identical || result.log_len != 100 {
+                // +1 for the no-op a new leader appends before client writes.
+                if !result.logs_identical || result.log_len != result.writes + 1 {
                     bail!(
                         "replicate failed: identical={} log_len={}",
                         result.logs_identical,

@@ -124,9 +124,22 @@ async fn peer_loop(peer: NodeId, endpoint: Endpoint, mut rx: mpsc::Receiver<pb::
                     tracing::debug!(peer, %error, "peer connect failed");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(BACKOFF_MAX);
-                    // Drop this message rather than hold it: by the time the
-                    // peer is reachable, a heartbeat or vote from the past is
-                    // worse than nothing.
+                    // Drop this message and everything queued behind it: by the
+                    // time the peer is reachable, a heartbeat or vote from the
+                    // past is worse than nothing. Draining one message per
+                    // backoff would also make shutdown wait out the whole
+                    // backlog, up to minutes, since `recv` yields buffered
+                    // messages before it reports the sender gone.
+                    loop {
+                        match rx.try_recv() {
+                            Ok(_) => {}
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                tracing::debug!(peer, "peer task stopping");
+                                return;
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -142,4 +155,38 @@ async fn peer_loop(peer: NodeId, endpoint: Endpoint, mut rx: mpsc::Receiver<pb::
     }
 
     tracing::debug!(peer, "peer task stopping");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_dead_peer_task_exits_promptly_despite_a_full_backlog() {
+        // A port nothing listens on, so every connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect_timeout(Duration::from_millis(100));
+
+        let (tx, rx) = mpsc::channel(PEER_QUEUE_DEPTH);
+        for _ in 0..PEER_QUEUE_DEPTH {
+            tx.try_send(pb::RaftMessage::default())
+                .expect("queue has room");
+        }
+        let task = tokio::spawn(peer_loop(2, endpoint, rx));
+        // Shutdown: the actor drops the transport, and with it this sender.
+        drop(tx);
+
+        // Paying one connect and one backoff per queued message would take
+        // minutes here; the backlog must be discarded instead.
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("peer task outlived its sender by over a second")
+            .expect("peer task panicked");
+    }
 }

@@ -1,10 +1,10 @@
-//! `ferrite` CLI — `validate`, `init`, and `run` subcommands.
+//! `ferrite` CLI — `validate`, `init`, `inspect`, and `run` subcommands.
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ferrite::{
-    cli::{InitArgs, ValidateArgs, run_init, run_validate},
+    cli::{InitArgs, ValidateArgs, run_init, run_inspect, run_validate},
     config::StorageBackend,
     server::run_node,
 };
@@ -78,6 +78,15 @@ enum Commands {
         /// Overwrite existing node*.toml files (leaves other files in --dir intact).
         #[arg(long)]
         force: bool,
+    },
+
+    /// Print a node's on-disk Raft state: hard state, snapshot, segments, log entries.
+    ///
+    /// Read-only; safe to run against a live node's data_dir.
+    Inspect {
+        /// Node data directory (`storage.data_dir` in its config), e.g. data/node1.
+        #[arg(long, value_name = "PATH")]
+        dir: PathBuf,
     },
 
     /// Run the Raft node until SIGTERM or Ctrl-C.
@@ -189,6 +198,11 @@ async fn run() -> anyhow::Result<()> {
             for path in &written {
                 println!("wrote {}", path.display());
             }
+        }
+
+        Commands::Inspect { dir } => {
+            tokio::task::spawn_blocking(move || run_inspect(&dir, &mut std::io::stdout().lock()))
+                .await??;
         }
 
         Commands::Run {

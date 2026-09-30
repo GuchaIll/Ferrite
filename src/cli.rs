@@ -1,13 +1,23 @@
-//! CLI command implementations: `ferrite validate` and `ferrite init`.
+//! CLI command implementations: `ferrite validate`, `ferrite init`, and `ferrite inspect`.
 //!
 //! This module owns everything user-facing: argument structs, flag parsing, and the
 //! `run_*` functions that execute each subcommand. Clap wiring and `main` dispatch
 //! live in the binary (future #20); these functions take plain structs so they can
 //! be tested without touching argv.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
-use crate::config::{Config, ConfigError, NodeId, Overrides};
+use crate::{
+    config::{Config, ConfigError, NodeId, Overrides},
+    error::StorageError,
+    kv::{ClientRequest, Command},
+    raft::storage::{record, replay},
+};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -30,6 +40,12 @@ pub enum CliError {
 
     #[error("{0}")]
     Init(String),
+
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+
+    #[error("{0}")]
+    Inspect(String),
 }
 
 // ── Flag parsing ──────────────────────────────────────────────────────────────
@@ -278,6 +294,144 @@ fn render_node_toml(
     out.push_str("format = \"pretty\"\n");
 
     out
+}
+
+// ── Inspect ───────────────────────────────────────────────────────────────────
+
+/// Writes a readable dump of a node's on-disk Raft state to `out`: hard state,
+/// snapshot boundary, segment files, and every log entry with its KV command.
+///
+/// Read-only. Unlike `DiskStorage::open`, it never truncates a torn tail or
+/// deletes `.tmp` files, so it is safe to point at a running node's `data_dir`.
+/// A torn tail is reported instead; on a live node it usually means a write in
+/// flight. Blocking IO — call via `spawn_blocking` from async.
+pub fn run_inspect(dir: &Path, out: &mut impl Write) -> Result<(), CliError> {
+    let log_dir = dir.join("log");
+    if !log_dir.is_dir() {
+        return Err(CliError::Inspect(format!(
+            "{} has no log/ directory; expected a node data_dir such as data/node1",
+            dir.display()
+        )));
+    }
+    writeln!(out, "data_dir: {}", dir.display())?;
+
+    let hard_state_path = dir.join("hard_state");
+    if hard_state_path.exists() {
+        let hs = record::decode_hard_state(&fs::read(&hard_state_path)?)?;
+        writeln!(
+            out,
+            "hard_state: term={} voted_for={:?}",
+            hs.current_term, hs.voted_for
+        )?;
+    } else {
+        writeln!(out, "hard_state: (none)")?;
+    }
+
+    let snapshot_path = dir.join("snapshot");
+    let snapshot = if snapshot_path.exists() {
+        Some(record::decode_snapshot(&fs::read(&snapshot_path)?)?)
+    } else {
+        None
+    };
+    match &snapshot {
+        Some(snap) => writeln!(
+            out,
+            "snapshot: last_included_index={} last_included_term={} data={} bytes",
+            snap.meta.last_included_index,
+            snap.meta.last_included_term,
+            snap.data.len()
+        )?,
+        None => writeln!(out, "snapshot: (none)")?,
+    }
+
+    // Same ordering `DiskStorage` uses: segments replay in ascending seq.
+    let mut seqs: Vec<u64> = fs::read_dir(&log_dir)?
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            name.to_str()?.strip_suffix(".seg")?.parse().ok()
+        })
+        .collect();
+    seqs.sort_unstable();
+
+    writeln!(out, "segments: {}", seqs.len())?;
+    let mut ops = Vec::new();
+    for seq in seqs {
+        let path = log_dir.join(format!("{seq:020}.seg"));
+        let bytes = fs::read(&path)?;
+        let decoded = record::decode(&bytes)?;
+        write!(
+            out,
+            "  {seq:020}.seg  {} bytes  {} ops",
+            bytes.len(),
+            decoded.ops.len()
+        )?;
+        if decoded.valid_len < bytes.len() {
+            write!(
+                out,
+                "  torn tail: {} bytes",
+                bytes.len() - decoded.valid_len
+            )?;
+        }
+        writeln!(out)?;
+        ops.extend(decoded.ops);
+    }
+
+    let truncations = ops
+        .iter()
+        .filter(|op| matches!(op, record::LogOp::TruncateFrom(_)))
+        .count();
+    let log = replay(&ops, snapshot.as_ref().map(|snap| &snap.meta))?;
+    let first = log.last_included_index() + 1;
+    let last = log.last_index();
+    writeln!(
+        out,
+        "log: entries {first}..={last} ({}) last_term={} truncations={truncations}",
+        last + 1 - first,
+        log.last_term()
+    )?;
+
+    // Keys and values are arbitrary bytes; show them as quoted lossy UTF-8.
+    let show = |bytes: &[u8]| format!("{:?}", String::from_utf8_lossy(bytes));
+    for index in first..=last {
+        let entry = log
+            .entry(index)
+            .map_err(|err| CliError::Inspect(err.to_string()))?;
+        let described = if entry.command.is_empty() {
+            "noop".to_owned()
+        } else {
+            match ClientRequest::decode(&entry.command) {
+                Ok(request) => {
+                    let origin = match request.client {
+                        Some(meta) => format!("client={} seq={}", meta.client_id, meta.seq_num),
+                        None => "internal".to_owned(),
+                    };
+                    let command = match &request.command {
+                        Command::Get { key } => format!("get {}", show(key)),
+                        Command::Set { key, value } => {
+                            format!("set {} = {}", show(key), show(value))
+                        }
+                        Command::Delete { key } => format!("delete {}", show(key)),
+                        Command::Cas {
+                            key,
+                            expected_version,
+                            value,
+                        } => format!(
+                            "cas {} expect={} {}",
+                            show(key),
+                            expected_version.map_or("absent".to_owned(), |v| v.to_string()),
+                            value
+                                .as_deref()
+                                .map_or("delete".to_owned(), |v| format!("= {}", show(v)))
+                        ),
+                    };
+                    format!("{origin} {command}")
+                }
+                Err(_) => format!("<undecodable command, {} bytes>", entry.command.len()),
+            }
+        };
+        writeln!(out, "  {index:>6}  t{:<4} {described}", entry.term)?;
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -556,5 +710,89 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Inspect ───────────────────────────────────────────────────────────
+
+    use crate::raft::{
+        HardState, LogEntry,
+        storage::{DiskStorage, LogOp, Storage, WriteBatch},
+    };
+
+    /// A data_dir holding term 2, a leader no-op, and one client `set`.
+    fn written_data_dir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let set = ClientRequest::new(
+            7,
+            1,
+            Command::Set {
+                key: b"foo".to_vec(),
+                value: b"bar".to_vec(),
+            },
+        );
+        let mut storage = DiskStorage::open(tmp.path()).unwrap();
+        storage
+            .commit(&WriteBatch {
+                hard_state: Some(HardState {
+                    current_term: 2,
+                    voted_for: Some(1),
+                }),
+                log: vec![
+                    LogOp::Append(LogEntry::new(1, 2, Vec::new())),
+                    LogOp::Append(LogEntry::new(2, 2, set.encode().unwrap())),
+                ],
+                snapshot: None,
+            })
+            .unwrap();
+        tmp
+    }
+
+    fn inspect(dir: &Path) -> String {
+        let mut out = Vec::new();
+        run_inspect(dir, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn inspect_prints_hard_state_and_decoded_entries() {
+        let tmp = written_data_dir();
+        let text = inspect(tmp.path());
+
+        assert!(
+            text.contains("hard_state: term=2 voted_for=Some(1)"),
+            "{text}"
+        );
+        assert!(text.contains("snapshot: (none)"), "{text}");
+        assert!(
+            text.contains("log: entries 1..=2 (2) last_term=2"),
+            "{text}"
+        );
+        assert!(text.contains("t2    noop"), "{text}");
+        assert!(
+            text.contains(r#"client=7 seq=1 set "foo" = "bar""#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn inspect_reports_torn_tail_without_truncating_it() {
+        let tmp = written_data_dir();
+        let seg = tmp.path().join("log").join(format!("{:020}.seg", 1));
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes.extend_from_slice(&[0xAB; 5]);
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let text = inspect(tmp.path());
+
+        assert!(text.contains("torn tail: 5 bytes"), "{text}");
+        assert!(text.contains("log: entries 1..=2"), "{text}");
+        assert_eq!(std::fs::read(&seg).unwrap().len(), bytes.len());
+    }
+
+    #[test]
+    fn inspect_rejects_dir_without_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_inspect(tmp.path(), &mut Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("no log/ directory"), "{err}");
     }
 }
