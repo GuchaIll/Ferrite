@@ -15,3 +15,14 @@
 pub mod raft {
     tonic::include_proto!("raft");
 }
+
+/// Types generated from `proto/kv.proto`.
+#[allow(
+    clippy::result_large_err,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_overindented_list_items
+)]
+pub mod kv {
+    tonic::include_proto!("kv");
+}
