@@ -72,7 +72,7 @@ sequenceDiagram
         F2Disk-->>F2: durable
         F2-->>Leader: AppendEntriesResponse(success, matchIndex)
     end
-    Leader->>Leader: quorum for a current-term entry; advance commitIndex
+    Leader->>Leader: quorum for a current-term entry, advance commitIndex
     Leader->>FSM: Apply entries in index order
     FSM-->>Leader: command result
     Leader-->>Client: response
