@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unnecessary_literal_unwrap))]
 
 pub mod cli;
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod kv;
