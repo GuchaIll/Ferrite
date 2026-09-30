@@ -11,11 +11,6 @@ fi
 # declarations, and every declared module must have a file. Rustc silently
 # ignores orphan files, so they rot without ever being compiled or linted.
 
-# Known orphans, each with the issue that resolves it. Remove entries as they land.
-allowed_unreachable=(
-    "src/kv/kv_client.rs"     # empty placeholder for issue 05's client
-)
-
 roots=()
 for root in src/lib.rs src/main.rs src/bin/*.rs src/bin/*/main.rs; do
     [[ -f "$root" ]] && roots+=("$root")
@@ -52,16 +47,8 @@ while ((${#queue[@]} > 0)); do
         '^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;' "$file" || true)
 done
 
-is_allowed() {
-    local candidate="$1" allowed
-    for allowed in "${allowed_unreachable[@]}"; do
-        [[ "$candidate" == "$allowed" ]] && return 0
-    done
-    return 1
-}
-
 while read -r file; do
-    if [[ "$reachable" != *$'\n'"$file"$'\n'* ]] && ! is_allowed "$file"; then
+    if [[ "$reachable" != *$'\n'"$file"$'\n'* ]]; then
         echo "unreachable module file: $file is not declared by any module reachable from a crate root" >&2
         failed=1
     fi

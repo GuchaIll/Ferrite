@@ -36,3 +36,6 @@ dist/
 /data/
 *.seg
 hard_state
+
+# Generated local-cluster configuration
+/cluster/
