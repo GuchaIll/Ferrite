@@ -5,5 +5,6 @@ pub mod node;
 pub mod raft_service;
 pub mod run;
 
+pub use kv_service::KvServiceImpl;
 pub use node::{Applied, NodeError, NodeHandle, NodeRuntime, Proposed, TickSchedule};
 pub use run::{RunError, run_node};
